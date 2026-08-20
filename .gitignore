@@ -1,4 +1,11 @@
+.DS_Store
+.idea/
 **/.venv/
 **/__pycache__/
-clients/macos/.build/
-.env
+apps/LocalMoshi/.build/
+config/local.env
+logs/
+*.app/
+engine/kyutai/.models/
+engine/kyutai/smoke.wav
+engine/kyutai/validate.log

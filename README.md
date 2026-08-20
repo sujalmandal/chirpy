@@ -1,75 +1,66 @@
 # Local Voice Assistant
 
-A deliberately small, local-first foundation for a real-time macOS voice assistant.
-
-The first slice is complete end to end:
-
-```text
-hold Space → record microphone → local Whisper STT → local OpenAI-compatible LLM
-→ sentence chunks → local Piper TTS → speaker
-```
-
-The macOS app is intentionally thin; the Python service owns model and tool orchestration. STT, LLM, and TTS are each behind a provider interface so their implementation can change without changing the client protocol. Each client session has short in-memory conversation context; “New chat” clears it. Nothing is persisted.
-
-## What you need
-
-- macOS 14+ and Xcode command-line tools
-- Python 3.11+
-- A local OpenAI-compatible chat endpoint. [Ollama](https://ollama.com/) works with `http://127.0.0.1:11434/v1`.
-- `whisper-cli` from [whisper.cpp](https://github.com/ggerganov/whisper.cpp), plus a GGML Whisper model
-- `piper` and a local Piper voice `.onnx` file
-
-Nothing in this starter sends audio or text to a cloud service. Web access is deliberately deferred to a later, explicit tool phase.
-
-## Run it
-
-```bash
-cd service
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-
-export WHISPER_CPP_BIN=/absolute/path/to/whisper-cli
-export WHISPER_MODEL=/absolute/path/to/ggml-base.en.bin
-export PIPER_BIN=/absolute/path/to/piper
-export PIPER_MODEL=/absolute/path/to/en_US-lessac-medium.onnx
-export LLM_MODEL=qwen3:14b
-uvicorn app.main:app --host 127.0.0.1 --port 8787
-```
-
-`service/.env.example` contains the same configuration as a copyable reference. The commands above intentionally keep the service on `127.0.0.1`.
-
-In a second terminal:
-
-```bash
-cd clients/macos
-swift run
-```
-
-Grant microphone permission when macOS asks. Hold the Space bar while the app window is focused, speak, and release to submit. Press Escape to cancel speech or an in-flight turn. The app starts playing each synthesized sentence as it arrives; cancelling stops playback and closes the streaming request (barge-in).
-
-For a quick service smoke test, use `curl` with a WAV file:
-
-```bash
-curl -N -F 'audio=@sample.wav;type=audio/wav' http://127.0.0.1:8787/v1/turn
-```
-
-## Repository layout
+Local Voice Assistant is a private, real-time voice assistant for Apple
+Silicon Macs. It pairs a native SwiftUI app with fully local, on-device speech
+models from Kyutai and an OpenAI-compatible cloud reasoning model.
 
 ```text
-service/                 Python agent service
-  app/providers.py       Swappable STT, chat, and TTS providers
-  app/main.py            Streaming turn protocol and sentence buffering
-clients/macos/           Small SwiftUI push-to-talk client
-docs/roadmap.md          Phased plan after the vertical slice
+Swift macOS app
+  ├─ local microphone + barge-in
+  ├─ Kyutai STT 1B (MLX) + semantic VAD
+  ├─ Kyutai TTS 1.6B (MLX)
+  └─ local agent service
+       └─ Ollama Cloud / OpenAI-compatible LLM stream
 ```
 
-## Model choices for the M4 Pro / 64 GiB
+## Setup (once)
 
-Start with a 9–14B instruct/coding model at 4-bit quantization for the voice path. Keep a larger coding model registered separately for deliberate, long-context work. The endpoint contract is OpenAI-compatible, so MLX, Ollama, llama.cpp server, or another local server can replace each other through environment configuration.
+Install the Python engine, dependencies, and model weights (~6.4 GB download)
+and run a smoke test that synthesizes and transcribes a phrase:
 
-## Important limitations of this starter
+```bash
+scripts/setup-kyutai.sh
+```
 
-- It is push-to-talk, not wake-word/VAD. That keeps the first latency and cancellation path easy to debug.
-- TTS is synthesized one sentence at a time. Piper starts promptly for short sentences; a future backend can use a genuinely streaming model without changing the wire protocol.
-- There is no authentication because the service binds to loopback only. Do not expose it on your LAN unchanged.
+Put cloud credentials in `config/local.env` (see `config/local.env.example`)
+to use an OpenAI-compatible cloud model.
+
+## Run
+
+Build and launch the app:
+
+```bash
+scripts/build-local-moshi-app.sh
+open "Local Voice Assistant.app"
+```
+
+The Swift app starts and owns the local agent process. Closing the app stops
+the agent. First launch downloads models on demand and takes a minute to load
+them.
+
+## Layout
+
+```text
+apps/LocalMoshi/       Native macOS SwiftUI app
+engine/kyutai/         Local Python agent: Kyutai STT + TTS (MLX), LLM streaming
+scripts/               Setup and build scripts
+docs/                  Product notes
+config/                Secrets and model configuration
+```
+
+## How it works
+
+The Swift app captures the microphone and streams 24 kHz Float32 PCM over a
+WebSocket to `engine/kyutai/agent.py`. Kyutai STT 1B transcribes on-device and
+its built-in semantic VAD detects natural end-of-turn (plus energy-based
+barge-in in the app). The transcript goes to an OpenAI-compatible cloud LLM, and
+the streamed reply is spoken by Kyutai TTS 1.6B running on MLX.
+
+The agent speaks a stable WebSocket protocol (JSON text events + binary PCM), so
+the STT/TTS/LLM providers can be swapped without touching the Swift UI.
+
+## Local data
+
+Model weights are stored outside this repository in
+`~/.cache/huggingface/hub`. The engine's Python venv and any generated files are
+local-only and ignored by Git.

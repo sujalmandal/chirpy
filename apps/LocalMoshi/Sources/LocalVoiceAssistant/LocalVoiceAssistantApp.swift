@@ -1,16 +1,15 @@
-import AppKit
 import SwiftUI
 
 @main
-struct LocalVoiceAssistantApp: App {
+struct LocalMoshiApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var assistant = VoiceAssistant()
+    @StateObject private var engine = KyutaiEngine()
 
     var body: some Scene {
-        WindowGroup("Local Voice Assistant") {
+        WindowGroup("Local Moshi") {
             ContentView()
-                .environmentObject(assistant)
-                .frame(minWidth: 520, minHeight: 400)
+                .environmentObject(engine)
+                .frame(minWidth: 920, minHeight: 660)
         }
     }
 }
@@ -26,5 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        KyutaiEngine.shared?.stop()
     }
 }
