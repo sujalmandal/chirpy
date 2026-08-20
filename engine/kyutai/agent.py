@@ -231,6 +231,7 @@ class SpeechToText:
     def reset(self):
         self.gen = self._new_gen()
         self.buffer = bytearray()
+        self.audio_tokenizer.reset()
 
     def step(self, pcm_float32: bytes) -> tuple[str | None, float]:
         """Feed arbitrary-size PCM bytes; returns (new text fragment, VAD prob).
