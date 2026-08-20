@@ -17,12 +17,12 @@ final class KyutaiSession: NSObject, ObservableObject {
     private var converter: AVAudioConverter?
     private var socket: URLSessionWebSocketTask?
     private let wsURL = URL(string: "ws://127.0.0.1:9000")!
-    private let bargeInThreshold: Float = 0.014
-    private var bargeInFrames = 0
 
     private let pcmLock = NSLock()
     private var pcmBuffer = Data()
     private var sendTask: Task<Void, Never>?
+    private var pendingBuffers = 0
+    private var turnDone = false
 
     override init() {
         recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
@@ -54,6 +54,10 @@ final class KyutaiSession: NSObject, ObservableObject {
     private func beginListening() {
         let input = audioEngine.inputNode
         do {
+            // Note: setVoiceProcessingEnabled(true) (echo cancellation) leaves
+            // the tap silent on this Mac, so it stays off. The agent discards
+            // mic audio while the assistant is speaking, which prevents the
+            // echo loop instead.
             let format = input.inputFormat(forBus: 0)
             converter = AVAudioConverter(from: format, to: recordingFormat)
             input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 100), format: format) { [weak self] buffer, _ in
@@ -99,19 +103,15 @@ final class KyutaiSession: NSObject, ObservableObject {
         guard isSpeaking else { return }
         sendJSON(["type": "interrupt"])
         player.stop()
+        pendingBuffers = 0
+        turnDone = false
         isSpeaking = false; status = "Listening…"
     }
 
     private func handleLevel(_ level: Float) {
-        if level >= bargeInThreshold {
-            bargeInFrames += 1
-            if isSpeaking && bargeInFrames >= 4 {
-                interrupt()
-                bargeInFrames = 0
-            }
-        } else {
-            bargeInFrames = 0
-        }
+        // Energy-based barge-in is disabled: without echo cancellation the
+        // assistant's own voice would trigger it and cut off its reply. Use the
+        // Interrupt button instead.
     }
 
     // -- Audio conversion (render-thread safe) --------------------------------
@@ -185,10 +185,14 @@ final class KyutaiSession: NSObject, ObservableObject {
                 reply = ""
             case "partial":
                 transcript = event["text"] as? String ?? ""
-            case "turn_started": isSpeaking = true
+            case "turn_started":
+                isSpeaking = true
+                turnDone = false
             case "text":
                 if let delta = event["delta"] as? String { reply += delta }
-            case "done": isSpeaking = false
+            case "done":
+                turnDone = true
+                if pendingBuffers <= 0 { isSpeaking = false; sendJSON(["type": "playback_done"]) }
             case "error": status = event["message"] as? String ?? "Agent error"
             default: break
             }
@@ -207,7 +211,18 @@ final class KyutaiSession: NSObject, ObservableObject {
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: AVAudioFrameCount(frames)), let samples = buffer.floatChannelData else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
         data.withUnsafeBytes { source in memcpy(samples[0], source.baseAddress!, data.count) }
-        player.scheduleBuffer(buffer)
+        pendingBuffers += 1
+        player.scheduleBuffer(buffer) { [weak self] in
+            Task { @MainActor in self?.bufferFinished() }
+        }
         if !player.isPlaying { player.play() }
+    }
+
+    private func bufferFinished() {
+        pendingBuffers -= 1
+        if pendingBuffers <= 0 && turnDone {
+            isSpeaking = false
+            sendJSON(["type": "playback_done"])
+        }
     }
 }

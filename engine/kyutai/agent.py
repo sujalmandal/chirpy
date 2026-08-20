@@ -343,6 +343,7 @@ class Agent:
         self.current_turn: asyncio.Task | None = None
         self.epoch = 0
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.playback_active = False
 
     async def send_event(self, **payload):
         await self.ws.send(json.dumps(payload))
@@ -380,6 +381,13 @@ class Agent:
             try:
                 pcm = await asyncio.wait_for(self.mic_queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
+                continue
+            # While the assistant's reply is still playing, discard mic audio so
+            # it never transcribes its own voice (echo loop). The client sends
+            # `playback_done` once the speaker is actually quiet, which clears
+            # this flag and resets STT. Barge-in is handled by the client
+            # sending `interrupt`, which cancels the turn and resets STT.
+            if self.playback_active:
                 continue
             rms = 0.0
             if pcm:
@@ -443,6 +451,7 @@ class Agent:
         if not reply.strip():
             await self.send_event(type="done")
             return
+        self.playback_active = True
         try:
             await self._mlx(self._tts_synthesize, reply, epoch)
         except asyncio.CancelledError:
@@ -503,8 +512,12 @@ class Agent:
                         continue
                     if event.get("type") == "interrupt":
                         self.epoch += 1
+                        self.playback_active = False
                         if self.current_turn and not self.current_turn.done():
                             self.current_turn.cancel()
+                        await self._mlx(Agent.stt.reset)
+                    elif event.get("type") == "playback_done":
+                        self.playback_active = False
                         await self._mlx(Agent.stt.reset)
         except websockets.ConnectionClosed:
             pass
