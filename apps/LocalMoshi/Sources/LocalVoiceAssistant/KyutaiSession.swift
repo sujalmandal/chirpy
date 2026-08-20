@@ -193,6 +193,11 @@ final class KyutaiSession: NSObject, ObservableObject {
             case "done":
                 turnDone = true
                 if pendingBuffers <= 0 { isSpeaking = false; sendJSON(["type": "playback_done"]) }
+            case "interrupted":
+                player.stop()
+                pendingBuffers = 0
+                turnDone = false
+                isSpeaking = false
             case "error": status = event["message"] as? String ?? "Agent error"
             default: break
             }

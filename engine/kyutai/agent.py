@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,12 +52,19 @@ _SILENCE = np.zeros(BLOCK_SAMPLES, dtype=np.float32).tobytes()
 
 HISTORY: dict[str, list[dict[str, str]]] = {}
 
+
+class TurnCancelled(Exception):
+    """Raised inside TTS generation when a barge-in cancels the turn."""
+
+
 # MLX/Metal is not thread-safe: STT and TTS must never run concurrently on
 # different threads. All inference goes through this single-worker executor so
 # there is a total order over Metal operations.
 MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
 
 LOG_PATH = ROOT / "logs" / "kyutai-agent.log"
+
+DEBUG = False
 
 
 def log(message: str) -> None:
@@ -76,6 +84,12 @@ def log(message: str) -> None:
         print(message, flush=True)
     except (BrokenPipeError, OSError):
         pass
+
+
+def debug(message: str) -> None:
+    """Log a line only when DEBUG is enabled (set DEBUG=1 in config/local.env)."""
+    if DEBUG:
+        log(f"[debug] {message}")
 
 
 def load_config() -> dict[str, str]:
@@ -308,12 +322,14 @@ class TextToSpeech:
 
         self.voice_path = self.model.get_voice_path(self.voice_name)
 
-    def synthesize(self, text: str, on_pcm):
+    def synthesize(self, text: str, on_pcm, should_cancel=None):
         entries = self.model.prepare_script([text])
         voices = [self.voice_path] if self.model.multi_speaker else []
         attributes = self.model.make_condition_attributes(voices, self.cfg_coef_conditioning)
 
         def on_frame(frame):
+            if should_cancel is not None and should_cancel():
+                raise TurnCancelled()
             if (frame == -1).any():
                 return
             pcm = self.model.mimi.decode_step(frame[:, :, None])
@@ -344,6 +360,12 @@ class Agent:
         self.epoch = 0
         self.loop: asyncio.AbstractEventLoop | None = None
         self.playback_active = False
+        # Barge-in state: played-PCM RMS history and estimated echo coupling.
+        self.played_rms: deque[tuple[float, float]] = deque(maxlen=64)
+        self.coupling_k: float | None = None
+        self.coupling_samples: list[float] = []
+        self.barge_run = 0
+        self.cancel_flag = False
 
     async def send_event(self, **payload):
         await self.ws.send(json.dumps(payload))
@@ -362,38 +384,80 @@ class Agent:
             epoch, pcm = await self.tts_queue.get()
             if epoch != self.epoch:
                 continue
+            samples = np.frombuffer(pcm, dtype=np.float32)
+            if samples.size:
+                rms = float(np.sqrt(np.mean(samples * samples)))
+                self.played_rms.append((time.time(), rms))
             await self.ws.send(pcm)
 
-    async def stt_loop(self):
-        """Consume mic PCM and detect end-of-turn; launch turns as separate tasks.
+    def _played_rms_now(self) -> float:
+        """RMS of the most recently played ~80 ms of TTS audio."""
+        now = time.time()
+        recent = [r for t, r in self.played_rms if now - t < 0.12]
+        return max(recent) if recent else 0.0
 
-        Turn end is energy-based with a hangover: a turn ends when we heard
-        speech (RMS above threshold for several blocks) followed by enough
-        consecutive quiet blocks. On end-of-turn, drain the STT's 0.5 s output
-        delay by feeding silence blocks (the flush trick), then finalize the
-        transcript.
+    async def _barge_in(self):
+        """Cancel the current turn and notify the client the user interrupted."""
+        self.cancel_flag = True
+        self.epoch += 1
+        self.playback_active = False
+        if self.current_turn and not self.current_turn.done():
+            self.current_turn.cancel()
+        await self.send_event(type="interrupted")
+        await self._mlx(Agent.stt.reset)
+        debug("barge-in: turn cancelled, STT reset")
+
+    async def stt_loop(self):
+        """Consume mic PCM, detect end-of-turn, and handle barge-in.
+
+        While the assistant is playing, mic audio is not transcribed; instead it
+        is compared against the played audio to detect the user talking over the
+        assistant (barge-in). When idle, energy + hangover detects end-of-turn.
         """
         stt = Agent.stt
         fragments: list[str] = []
         speech_run = 0
         silence_run = 0
+        grace_until = 0.0
         while True:
             try:
                 pcm = await asyncio.wait_for(self.mic_queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
-                continue
-            # While the assistant's reply is still playing, discard mic audio so
-            # it never transcribes its own voice (echo loop). The client sends
-            # `playback_done` once the speaker is actually quiet, which clears
-            # this flag and resets STT. Barge-in is handled by the client
-            # sending `interrupt`, which cancels the turn and resets STT.
-            if self.playback_active:
                 continue
             rms = 0.0
             if pcm:
                 samples = np.frombuffer(pcm, dtype=np.float32)
                 if samples.size:
                     rms = float(np.sqrt(np.mean(samples * samples)))
+
+            # --- Barge-in detection while the assistant is playing ----------
+            if self.playback_active:
+                played = self._played_rms_now()
+                # Estimate echo coupling k = mic_rms / played_rms during the
+                # first moments of playback (assume the user is silent then).
+                if played > 0.005 and self.coupling_k is None:
+                    self.coupling_samples.append(rms / played)
+                    if len(self.coupling_samples) >= 8:
+                        self.coupling_samples.sort()
+                        self.coupling_k = self.coupling_samples[len(self.coupling_samples) // 2]
+                        debug(f"barge-in: coupling k={self.coupling_k:.3f}")
+                threshold = 0.01
+                if self.coupling_k is not None:
+                    threshold = max(0.01, self.coupling_k * played * 2.5)
+                if rms > threshold:
+                    self.barge_run += 1
+                    if self.barge_run >= 3:
+                        await self._barge_in()
+                        self.barge_run = 0
+                        grace_until = time.time() + 0.3
+                else:
+                    self.barge_run = 0
+                continue
+
+            # --- Grace period after barge-in (let echo tail die) ------------
+            if time.time() < grace_until:
+                continue
+
             try:
                 fragment, _vad = await self._mlx(stt.step, pcm)
             except Exception as error:
@@ -420,8 +484,17 @@ class Agent:
                 silence_run = 0
                 while not self.mic_queue.empty():
                     self.mic_queue.get_nowait()
-                if transcript and (self.current_turn is None or self.current_turn.done()):
-                    self.current_turn = asyncio.create_task(self.run_turn(transcript))
+                if not transcript:
+                    continue
+                # If a turn is still running (e.g. LLM still streaming), cancel
+                # it and start the new one with the fresh transcript.
+                if self.current_turn is not None and not self.current_turn.done():
+                    self.cancel_flag = True
+                    self.epoch += 1
+                    self.current_turn.cancel()
+                    await self.send_event(type="interrupted")
+                    debug("stt: superseded running turn with new transcript")
+                self.current_turn = asyncio.create_task(self.run_turn(transcript))
 
     async def _finalize(self, stt, fragments: list[str]) -> str:
         """Feed trailing silence to flush the delayed STT output, then reset."""
@@ -435,6 +508,10 @@ class Agent:
     async def run_turn(self, transcript: str):
         self.epoch += 1
         epoch = self.epoch
+        self.cancel_flag = False
+        self.coupling_k = None
+        self.coupling_samples = []
+        self.barge_run = 0
         log(f"turn transcript: {transcript!r}")
         await self.send_event(type="transcript", text=transcript)
         await self.send_event(type="turn_started")
@@ -456,6 +533,9 @@ class Agent:
             await self._mlx(self._tts_synthesize, reply, epoch)
         except asyncio.CancelledError:
             raise
+        except TurnCancelled:
+            debug("turn cancelled during TTS")
+            return
         except Exception as error:
             await self.send_event(type="error", message=f"TTS: {error}")
         HISTORY.setdefault(self.session_id, []).extend(
@@ -488,7 +568,7 @@ class Agent:
             yield value
 
     def _tts_synthesize(self, reply: str, epoch: int):
-        Agent.tts.synthesize(reply, self._emit_pcm(epoch))
+        Agent.tts.synthesize(reply, self._emit_pcm(epoch), should_cancel=lambda: self.cancel_flag)
 
     def _emit_pcm(self, epoch: int):
         loop = self.loop
@@ -513,11 +593,13 @@ class Agent:
                     if event.get("type") == "interrupt":
                         self.epoch += 1
                         self.playback_active = False
+                        self.cancel_flag = True
                         if self.current_turn and not self.current_turn.done():
                             self.current_turn.cancel()
                         await self._mlx(Agent.stt.reset)
                     elif event.get("type") == "playback_done":
                         self.playback_active = False
+                        self.cancel_flag = False
                         await self._mlx(Agent.stt.reset)
         except websockets.ConnectionClosed:
             pass
@@ -527,12 +609,16 @@ class Agent:
 
 
 def main():
+    global DEBUG
     config = load_config()
+    DEBUG = config.get("DEBUG", "").strip() in ("1", "true", "yes", "on")
     _READY["config"] = config
     port = int(config.get("AGENT_PORT", "8999"))
     ws_port = port + 1
 
     log("Loading Kyutai models (first run downloads weights)…")
+    if DEBUG:
+        log("debug logging enabled")
     Agent.stt = SpeechToText(config)
     _READY["stt_ready"] = True
     log("STT ready")
