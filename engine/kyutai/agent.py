@@ -360,12 +360,21 @@ class Agent:
         self.epoch = 0
         self.loop: asyncio.AbstractEventLoop | None = None
         self.playback_active = False
+        self.synthesizing = False
         # Barge-in state: played-PCM RMS history and estimated echo coupling.
         self.played_rms: deque[tuple[float, float]] = deque(maxlen=64)
+        self.played_now = 0.0
         self.coupling_k: float | None = None
         self.coupling_samples: list[float] = []
         self.barge_run = 0
         self.cancel_flag = False
+        self.playback_started = 0.0
+        self.last_k_update = 0.0
+        # Audio/text accounting (per turn + per session).
+        self.turn_audio_bytes = 0
+        self.turn_audio_seconds = 0.0
+        self.session_audio_seconds = 0.0
+        self.session_text_chars = 0
 
     async def send_event(self, **payload):
         await self.ws.send(json.dumps(payload))
@@ -388,13 +397,28 @@ class Agent:
             if samples.size:
                 rms = float(np.sqrt(np.mean(samples * samples)))
                 self.played_rms.append((time.time(), rms))
+                # Decaying played-energy: covers echo tails during generation
+                # pauses (moshi-mlx emits frames in bursts). Slow decay so the
+                # echo tail (longer than one 80 ms block) is still covered.
+                self.played_now = max(rms, self.played_now * 0.7)
+                self.turn_audio_bytes += len(pcm)
+                self.turn_audio_seconds += samples.size / SAMPLE_RATE
             await self.ws.send(pcm)
 
-    def _played_rms_now(self) -> float:
-        """RMS of the most recently played ~80 ms of TTS audio."""
-        now = time.time()
-        recent = [r for t, r in self.played_rms if now - t < 0.12]
-        return max(recent) if recent else 0.0
+    def _played_energy(self) -> float:
+        """Current decayed played-RMS (echo tail aware)."""
+        return self.played_now
+
+    def _played_rms_delayed(self, delay: float = 0.08) -> float:
+        """Played RMS from ~`delay` seconds ago (echo arrives at the mic late)."""
+        target = time.time() - delay
+        best = 0.0
+        for t, r in self.played_rms:
+            if t <= target:
+                best = r
+            else:
+                break
+        return best
 
     async def _barge_in(self):
         """Cancel the current turn and notify the client the user interrupted."""
@@ -405,6 +429,7 @@ class Agent:
             self.current_turn.cancel()
         await self.send_event(type="interrupted")
         await self._mlx(Agent.stt.reset)
+        log(f"turn audio: {self.turn_audio_seconds:.1f} s ({self.turn_audio_bytes} bytes) — cancelled")
         debug("barge-in: turn cancelled, STT reset")
 
     async def stt_loop(self):
@@ -432,26 +457,56 @@ class Agent:
 
             # --- Barge-in detection while the assistant is playing ----------
             if self.playback_active:
-                played = self._played_rms_now()
-                # Estimate echo coupling k = mic_rms / played_rms during the
-                # first moments of playback (assume the user is silent then).
-                if played > 0.005 and self.coupling_k is None:
-                    self.coupling_samples.append(rms / played)
-                    if len(self.coupling_samples) >= 8:
+                played = self._played_energy()
+                elapsed = time.time() - self.playback_started
+                # Only arm barge-in while TTS is actively synthesizing. Once
+                # synthesis finishes, the remaining playback is just the drain
+                # of already-buffered audio; its echo tail must not trigger a
+                # false barge-in.
+                if not self.synthesizing:
+                    continue
+                # Estimate echo coupling k = mic_rms / played_rms(delayed). The
+                # mic hears the echo ~80 ms AFTER the speaker plays it, so we
+                # divide by the delayed played RMS; using the instantaneous value
+                # drags the estimate down during the attack transient.
+                played_delayed = self._played_rms_delayed(0.08)
+                if played_delayed > 0.005 and self.coupling_k is None and elapsed > 0.16:
+                    self.coupling_samples.append(rms / played_delayed)
+                    if len(self.coupling_samples) >= 12:
                         self.coupling_samples.sort()
-                        self.coupling_k = self.coupling_samples[len(self.coupling_samples) // 2]
+                        # 90th percentile: echo is variable, worst case matters.
+                        idx = int(len(self.coupling_samples) * 0.9)
+                        self.coupling_k = max(0.1, self.coupling_samples[idx])
+                        self.last_k_update = time.time()
                         debug(f"barge-in: coupling k={self.coupling_k:.3f}")
-                threshold = 0.01
+                # Slow continuous re-estimation: when the user is likely silent
+                # (mic below threshold) for a while, nudge k toward the current
+                # delayed ratio so it adapts to volume changes.
+                elif (
+                    self.coupling_k is not None
+                    and played_delayed > 0.005
+                    and time.time() - self.last_k_update > 1.0
+                ):
+                    ratio = rms / played_delayed
+                    if ratio < self.coupling_k * 1.5:
+                        self.coupling_k = max(0.1, self.coupling_k * 0.9 + ratio * 0.1)
+                        self.last_k_update = time.time()
+                threshold = 0.05
                 if self.coupling_k is not None:
-                    threshold = max(0.01, self.coupling_k * played * 2.5)
-                if rms > threshold:
-                    self.barge_run += 1
-                    if self.barge_run >= 3:
-                        await self._barge_in()
+                    threshold = max(0.05, self.coupling_k * played * 3.0)
+                # Blind period: never trigger barge-in in the first 1.0 s of
+                # playback (needed to learn the echo level).
+                if elapsed >= 1.0:
+                    if rms > threshold:
+                        self.barge_run += 1
+                        if self.barge_run >= 3:
+                            await self._barge_in()
+                            self.barge_run = 0
+                            grace_until = time.time() + 0.3
+                    else:
                         self.barge_run = 0
-                        grace_until = time.time() + 0.3
-                else:
-                    self.barge_run = 0
+                if DEBUG and self.barge_run > 0:
+                    debug(f"barge-in: mic={rms:.4f} played={played:.4f} k={self.coupling_k} thr={threshold:.4f} run={self.barge_run}")
                 continue
 
             # --- Grace period after barge-in (let echo tail die) ------------
@@ -512,6 +567,10 @@ class Agent:
         self.coupling_k = None
         self.coupling_samples = []
         self.barge_run = 0
+        self.played_now = 0.0
+        self.last_k_update = 0.0
+        self.turn_audio_bytes = 0
+        self.turn_audio_seconds = 0.0
         log(f"turn transcript: {transcript!r}")
         await self.send_event(type="transcript", text=transcript)
         await self.send_event(type="turn_started")
@@ -528,7 +587,11 @@ class Agent:
         if not reply.strip():
             await self.send_event(type="done")
             return
+        log(f"turn text: {len(reply)} chars")
         self.playback_active = True
+        self.synthesizing = True
+        self.playback_started = time.time()
+        log(f"turn flushed: {len(reply)} chars → TTS")
         try:
             await self._mlx(self._tts_synthesize, reply, epoch)
         except asyncio.CancelledError:
@@ -538,10 +601,17 @@ class Agent:
             return
         except Exception as error:
             await self.send_event(type="error", message=f"TTS: {error}")
+        self.synthesizing = False
         HISTORY.setdefault(self.session_id, []).extend(
             [{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}]
         )
-        log(f"turn complete, reply={len(reply)} chars")
+        self.session_audio_seconds += self.turn_audio_seconds
+        self.session_text_chars += len(reply)
+        log(
+            f"turn complete, reply={len(reply)} chars · "
+            f"turn audio: {self.turn_audio_seconds:.1f} s ({self.turn_audio_bytes} bytes) · "
+            f"session audio: {self.session_audio_seconds:.1f} s · session text: {self.session_text_chars} chars"
+        )
         await self.send_event(type="done")
 
     async def _llm_stream_async(self, transcript: str):
