@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -49,6 +50,11 @@ FLUSH_BLOCKS = 8  # ~0.64 s of silence to drain the STT's 0.5 s output delay
 _SILENCE = np.zeros(BLOCK_SAMPLES, dtype=np.float32).tobytes()
 
 HISTORY: dict[str, list[dict[str, str]]] = {}
+
+# MLX/Metal is not thread-safe: STT and TTS must never run concurrently on
+# different threads. All inference goes through this single-worker executor so
+# there is a total order over Metal operations.
+MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
 
 LOG_PATH = ROOT / "logs" / "kyutai-agent.log"
 
@@ -341,6 +347,15 @@ class Agent:
     async def send_event(self, **payload):
         await self.ws.send(json.dumps(payload))
 
+    async def _mlx(self, fn, *args):
+        """Run an MLX/Metal call on the single shared worker thread.
+
+        MLX is not thread-safe, so every inference call must be serialized
+        through one thread to avoid concurrent Metal command-encoder state.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(MLX_EXECUTOR, fn, *args)
+
     async def out_writer(self):
         while True:
             epoch, pcm = await self.tts_queue.get()
@@ -372,10 +387,10 @@ class Agent:
                 if samples.size:
                     rms = float(np.sqrt(np.mean(samples * samples)))
             try:
-                fragment, _vad = await asyncio.to_thread(stt.step, pcm)
+                fragment, _vad = await self._mlx(stt.step, pcm)
             except Exception as error:
                 log(f"STT step error: {error}")
-                stt.reset()
+                await self._mlx(stt.reset)
                 fragments.clear()
                 speech_run = 0
                 silence_run = 0
@@ -403,15 +418,16 @@ class Agent:
     async def _finalize(self, stt, fragments: list[str]) -> str:
         """Feed trailing silence to flush the delayed STT output, then reset."""
         for _ in range(FLUSH_BLOCKS):
-            fragment, _ = await asyncio.to_thread(stt.step, _SILENCE)
+            fragment, _ = await self._mlx(stt.step, _SILENCE)
             if fragment:
                 fragments.append(fragment)
-        stt.reset()
+        await self._mlx(stt.reset)
         return "".join(fragments).strip()
 
     async def run_turn(self, transcript: str):
         self.epoch += 1
         epoch = self.epoch
+        log(f"turn transcript: {transcript!r}")
         await self.send_event(type="transcript", text=transcript)
         await self.send_event(type="turn_started")
         reply = ""
@@ -428,7 +444,7 @@ class Agent:
             await self.send_event(type="done")
             return
         try:
-            await asyncio.to_thread(self._tts_synthesize, reply, epoch)
+            await self._mlx(self._tts_synthesize, reply, epoch)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -436,6 +452,7 @@ class Agent:
         HISTORY.setdefault(self.session_id, []).extend(
             [{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}]
         )
+        log(f"turn complete, reply={len(reply)} chars")
         await self.send_event(type="done")
 
     async def _llm_stream_async(self, transcript: str):
@@ -488,7 +505,7 @@ class Agent:
                         self.epoch += 1
                         if self.current_turn and not self.current_turn.done():
                             self.current_turn.cancel()
-                        Agent.stt.reset()
+                        await self._mlx(Agent.stt.reset)
         except websockets.ConnectionClosed:
             pass
         finally:
