@@ -14,6 +14,8 @@ struct KyutaiConversationView: View {
                 Button("Interrupt") { session.interrupt() }.disabled(!session.isSpeaking)
             }.font(.headline)
 
+            WaveformView(micLevel: session.micLevel, speakerLevel: session.speakerLevel)
+
             GroupBox("You") {
                 ScrollView {
                     Text(session.transcript.isEmpty ? "Speak naturally. Kyutai STT detects the end of your turn." : session.transcript)
@@ -37,11 +39,19 @@ struct KyutaiConversationView: View {
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
             GroupBox("Engine log") {
-                ScrollView {
-                    Text(engine.logs).font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(engine.logs).font(.system(.caption, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                            .id("logBottom")
+                    }
+                    .frame(minHeight: 110, maxHeight: 170, alignment: .topLeading)
+                    .onChange(of: engine.logs) { _, _ in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("logBottom", anchor: .bottom)
+                        }
+                    }
                 }
-                .frame(minHeight: 110, maxHeight: 170, alignment: .topLeading)
             }
         }.padding(20)
     }

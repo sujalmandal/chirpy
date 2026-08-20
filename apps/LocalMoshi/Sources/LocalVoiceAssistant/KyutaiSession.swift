@@ -8,6 +8,8 @@ final class KyutaiSession: NSObject, ObservableObject {
     @Published private(set) var reply = ""
     @Published private(set) var isListening = false
     @Published private(set) var isSpeaking = false
+    @Published private(set) var micLevel: Float = 0
+    @Published private(set) var speakerLevel: Float = 0
 
     private let audioEngine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -109,9 +111,10 @@ final class KyutaiSession: NSObject, ObservableObject {
     }
 
     private func handleLevel(_ level: Float) {
-        // Energy-based barge-in is disabled: without echo cancellation the
-        // assistant's own voice would trigger it and cut off its reply. Use the
-        // Interrupt button instead.
+        // Display-only: energy-based barge-in is disabled (without echo
+        // cancellation the assistant's own voice would trigger it). This level
+        // just drives the mic waveform in the UI.
+        micLevel = level
     }
 
     // -- Audio conversion (render-thread safe) --------------------------------
@@ -216,6 +219,9 @@ final class KyutaiSession: NSObject, ObservableObject {
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: AVAudioFrameCount(frames)), let samples = buffer.floatChannelData else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
         data.withUnsafeBytes { source in memcpy(samples[0], source.baseAddress!, data.count) }
+        var power: Float = 0
+        for i in 0..<frames { power += samples[0][i] * samples[0][i] }
+        speakerLevel = sqrt(power / Float(frames))
         pendingBuffers += 1
         player.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in self?.bufferFinished() }
@@ -225,9 +231,12 @@ final class KyutaiSession: NSObject, ObservableObject {
 
     private func bufferFinished() {
         pendingBuffers -= 1
-        if pendingBuffers <= 0 && turnDone {
-            isSpeaking = false
-            sendJSON(["type": "playback_done"])
+        if pendingBuffers <= 0 {
+            speakerLevel = 0
+            if turnDone {
+                isSpeaking = false
+                sendJSON(["type": "playback_done"])
+            }
         }
     }
 }
