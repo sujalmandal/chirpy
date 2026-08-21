@@ -12,10 +12,13 @@ Run with:
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 from pathlib import Path
 
+from livekit import rtc
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, room_io
 from livekit.agents.inference import TurnDetector
 from livekit.plugins import dtln, openai, silero
@@ -26,6 +29,53 @@ logger = logging.getLogger("chirpy.agent")
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "config" / "local.env"
+
+
+async def _publish(ctx: JobContext, payload: dict) -> None:
+    """Publish a JSON data message to the room so the client can render it."""
+    if ctx.room.isconnected():
+        await ctx.room.local_participant.publish_data(
+            json.dumps(payload).encode("utf-8"), topic="chirpy"
+        )
+
+
+def _setup_transcript_bridge(ctx: JobContext, session: AgentSession) -> None:
+    """Forward the voice session's transcript to the client as data events.
+
+    The client renders a full user/assistant conversation from these events:
+      - {"type": "partial", "text": ...}   live user caption
+      - {"type": "user", "text": ...}      final user transcript
+      - {"type": "assistant_delta", "text": ...}  assistant text (committed)
+      - {"type": "assistant_end"}          assistant finished speaking
+    """
+
+    def on_user_transcribed(ev) -> None:
+        if not ev.transcript:
+            return
+        logger.info("bridge user_transcribed final=%s text=%r", ev.is_final, ev.transcript)
+        asyncio.create_task(
+            _publish(
+                ctx,
+                {
+                    "type": "partial" if not ev.is_final else "user",
+                    "text": ev.transcript,
+                },
+            )
+        )
+
+    def on_conversation_item_added(ev) -> None:
+        item = ev.item
+        if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant":
+            text = getattr(item, "text_content", None)
+            logger.info("bridge assistant item role=%s text=%r", getattr(item, "role", None), text)
+            if text:
+                asyncio.create_task(
+                    _publish(ctx, {"type": "assistant_delta", "text": text})
+                )
+                asyncio.create_task(_publish(ctx, {"type": "assistant_end"}))
+
+    session.on("user_input_transcribed", on_user_transcribed)
+    session.on("conversation_item_added", on_conversation_item_added)
 
 
 def load_config() -> dict[str, str]:
@@ -81,6 +131,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     agent = Agent(instructions=system_prompt)
+    _setup_transcript_bridge(ctx, session)
     await session.start(
         agent=agent,
         room=ctx.room,

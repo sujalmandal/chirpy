@@ -228,33 +228,21 @@ class VoiceSession {
       return;
     }
     switch (event.type) {
-      case "transcript":
-        this.transcript = (event.text as string) ?? "";
-        this.reply = "";
-        this.onTranscript(this.transcript);
-        this.onUserMessage(this.transcript);
-        break;
       case "partial":
         this.transcript = (event.text as string) ?? "";
         this.onTranscript(this.transcript);
         break;
-      case "turn_started":
-        this.speaking = true;
-        this.onSpeaking(true);
+      case "user":
+        this.transcript = (event.text as string) ?? "";
         this.reply = "";
-        this.onAssistantStart();
+        this.onUserMessage(this.transcript);
         break;
-      case "text":
-        this.reply += (event.delta as string) ?? "";
+      case "assistant_delta":
+        this.reply += (event.text as string) ?? "";
         this.onReply(this.reply);
-        this.onAssistantDelta((event.delta as string) ?? "");
+        this.onAssistantDelta((event.text as string) ?? "");
         break;
-      case "done":
-        this.speaking = false;
-        this.onSpeaking(false);
-        this.onAssistantEnd();
-        break;
-      case "interrupted":
+      case "assistant_end":
         this.speaking = false;
         this.onSpeaking(false);
         this.onAssistantEnd();
@@ -420,6 +408,8 @@ function updateLastAssistant(delta: string) {
   if (last && last.classList.contains("assistant")) {
     const textEl = last.querySelector(".msg-text");
     if (textEl) textEl.textContent = (textEl.textContent || "") + delta;
+    const m = messages[messages.length - 1];
+    if (m && m.role === "assistant") m.text += delta;
     box.scrollTop = box.scrollHeight;
   }
 }
@@ -431,6 +421,8 @@ function finishLastAssistant() {
   if (last && last.classList.contains("assistant")) {
     last.classList.remove("streaming");
     last.classList.add("completed");
+    const m = messages[messages.length - 1];
+    if (m && m.role === "assistant") m.state = "completed";
   }
 }
 
@@ -537,11 +529,15 @@ async function init() {
       messages.push({ role: "user", text: e.payload as string, time: now(), state: "completed" });
       appendMessage(messages[messages.length - 1]);
     });
-    listen("conversation-assistant-start", () => {
-      messages.push({ role: "assistant", text: "", time: now(), state: "streaming" });
-      appendMessage(messages[messages.length - 1]);
+    listen("conversation-assistant-delta", (e) => {
+      // Create the assistant bubble lazily on the first delta.
+      const last = messages[messages.length - 1];
+      if (!last || last.role !== "assistant" || last.state !== "streaming") {
+        messages.push({ role: "assistant", text: "", time: now(), state: "streaming" });
+        appendMessage(messages[messages.length - 1]);
+      }
+      updateLastAssistant(e.payload as string);
     });
-    listen("conversation-assistant-delta", (e) => updateLastAssistant(e.payload as string));
     listen("conversation-assistant-end", () => finishLastAssistant());
     session.onStatus = (s) => {
       const el = document.getElementById("status");
@@ -569,7 +565,6 @@ async function init() {
     };
     // Broadcast the conversation to the debug window.
     session.onUserMessage = (text) => emit("conversation-user", text);
-    session.onAssistantStart = () => emit("conversation-assistant-start", null);
     session.onAssistantDelta = (delta) => emit("conversation-assistant-delta", delta);
     session.onAssistantEnd = () => emit("conversation-assistant-end", null);
     setInterval(pollStatus, 1000);
