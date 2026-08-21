@@ -2,7 +2,7 @@
 """Smoke test for the Chirpy engine: load STT + TTS, synthesize a phrase to a
 WAV file, transcribe it back, and print both. Run after setup with:
 
-    engine/kyutai/.venv/bin/python engine/kyutai/validate.py
+    engine/chirpy/.venv/bin/python engine/chirpy/validate.py
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from agent import ROOT, load_config
 from plugins.kokoro_tts import KokoroTTS
 from plugins.whisper_stt import WhisperSTT
 
-OUT = ROOT / "engine" / "kyutai" / "smoke.wav"
+OUT = ROOT / "engine" / "chirpy" / "smoke.wav"
 PHRASE = "Welcome to Chirpy."
 
 

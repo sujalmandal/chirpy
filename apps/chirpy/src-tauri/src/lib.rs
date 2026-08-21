@@ -59,8 +59,8 @@ fn project_root() -> PathBuf {
 
 fn engine_paths() -> (PathBuf, PathBuf) {
     let root = project_root();
-    let venv = root.join("engine/kyutai/.venv/bin/python");
-    let script = root.join("engine/kyutai/agent.py");
+    let venv = root.join("engine/chirpy/.venv/bin/python");
+    let script = root.join("engine/chirpy/agent.py");
     (venv, script)
 }
 
@@ -110,13 +110,13 @@ fn start_backend(state: tauri::State<Mutex<BackendState>>, config: serde_json::V
     if !is_running(&mut state.agent) {
         let (venv, script) = engine_paths();
         if !venv.exists() || !script.exists() {
-            return Err("Chirpy engine is not set up. Run scripts/setup-kyutai.sh first.".into());
+            return Err("Chirpy engine is not set up. Run scripts/setup.sh first.".into());
         }
         let (file, path) = open_log(&log_dir, "chirpy-agent.log")?;
         let mut cmd = Command::new(&venv);
         cmd.arg(&script)
             .arg("start")
-            .current_dir(root.join("engine/kyutai"))
+            .current_dir(root.join("engine/chirpy"))
             .stdout(Stdio::from(file.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(file))
             .env("LIVEKIT_URL", LIVEKIT_URL)

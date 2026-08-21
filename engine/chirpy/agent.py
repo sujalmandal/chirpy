@@ -8,7 +8,7 @@ wrapped as LiveKit STT/TTS plugins). The LLM is any OpenAI-compatible endpoint
 (LM Studio or hosted). VAD and turn detection are LiveKit-native (Silero).
 
 Run with:
-    engine/kyutai/.venv/bin/python engine/kyutai/agent.py start
+    engine/chirpy/.venv/bin/python engine/chirpy/agent.py start
 """
 from __future__ import annotations
 

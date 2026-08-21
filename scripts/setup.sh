@@ -6,7 +6,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
-engine_dir="$project_dir/engine/kyutai"
+engine_dir="$project_dir/engine/chirpy"
 venv_python="$engine_dir/.venv/bin/python"
 
 echo "==> Creating Python 3.12 virtual environment"

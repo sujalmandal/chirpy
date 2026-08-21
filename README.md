@@ -7,7 +7,7 @@ The primary interface is a borderless floating orb designed for continuous conve
 ## Highlights
 
 - Local speech recognition and speech synthesis on-device (faster-whisper STT + Kokoro TTS)
-- Streaming conversation with interruption support: speak while the assistant is responding to take the floor
+- Turn-based conversation with DTLN noise suppression on the mic input
 - Media routing and echo-cancelled capture handled by a self-hosted LiveKit server
 - Floating, borderless voice interface with distinct connecting, listening, idle, and speaking states
 - Live transcript and reply captions that clear automatically
@@ -41,7 +41,7 @@ flowchart LR
 
 - **Client** — a Tauri 2 app (Rust + webview) that connects to the LiveKit room, publishes the echo-cancelled microphone, and plays the agent's audio. The Rust backend spawns `livekit-server --dev` and the agent worker, and issues room tokens.
 - **LiveKit server** — the self-hosted SFU that routes media between the client and the agent worker.
-- **Agent worker** — a Python `livekit-agents` process that runs the voice pipeline: Silero VAD, faster-whisper STT, an OpenAI-compatible LLM, and Kokoro TTS. Turn detection and barge-in are LiveKit-native.
+- **Agent worker** — a Python `livekit-agents` process that runs the voice pipeline: Silero VAD, faster-whisper STT, an OpenAI-compatible LLM, and Kokoro TTS, with DTLN noise suppression on the inbound audio.
 
 ## Requirements
 
@@ -59,7 +59,7 @@ The initial setup downloads the small local speech models (faster-whisper `base`
 Install the local engine, its dependencies, the LiveKit server, and validate the speech stack:
 
 ```bash
-scripts/setup-kyutai.sh
+scripts/setup.sh
 ```
 
 Build and launch the native application:
@@ -107,7 +107,7 @@ Audio capture, VAD, transcription, and speech synthesis stay on the Mac. The con
 
 ```text
 apps/chirpy/             Tauri 2 multiplatform desktop client
-engine/kyutai/           Local STT/TTS models + LiveKit agent worker
+engine/chirpy/           Local STT/TTS models + LiveKit agent worker
   plugins/               faster-whisper STT + Kokoro TTS LiveKit Agents plugins
 config/                  Example local configuration
 scripts/                 Setup and application build scripts

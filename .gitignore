@@ -9,6 +9,6 @@
 config/local.env
 logs/
 *.app/
-engine/kyutai/.models/
-engine/kyutai/smoke.wav
-engine/kyutai/validate.log
+engine/chirpy/.models/
+engine/chirpy/smoke.wav
+engine/chirpy/validate.log
