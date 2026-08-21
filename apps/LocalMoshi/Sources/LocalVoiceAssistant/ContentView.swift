@@ -38,6 +38,7 @@ private struct AssistantView: View {
         VStack(spacing: 10) {
             VoiceOrb(
                 speakerLevel: session.speakerLevel,
+                isReady: engine.isReady,
                 isListening: session.isListening,
                 isSpeaking: session.isSpeaking
             )
@@ -178,6 +179,7 @@ private struct AssistantView: View {
 
 private struct VoiceOrb: View {
     let speakerLevel: Float
+    let isReady: Bool
     let isListening: Bool
     let isSpeaking: Bool
 
@@ -190,28 +192,83 @@ private struct VoiceOrb: View {
                 let restingBeat = CGFloat((sin(time * 7.2) + 1) * 0.008)
                 let beat = isSpeaking ? 1 + max(restingBeat, output * 0.09) : 1
                 ZStack {
-                    Circle()
-                        .fill(orbGradient)
-                        .shadow(color: glowColor.opacity(isSpeaking ? 0.44 : 0.26), radius: isSpeaking ? 8 : 5)
-                    Circle()
-                        .fill(
-                            RadialGradient(
-                                colors: [.white.opacity(0.58), .white.opacity(0.10), .clear],
-                                center: UnitPoint(x: 0.34, y: 0.25),
-                                startRadius: 0,
-                                endRadius: size * 0.46
-                            )
-                        )
-                    Circle()
-                        .stroke(.white.opacity(0.52), lineWidth: 1.15)
+                    if isReady {
+                        ZStack {
+                            Circle()
+                                .fill(orbGradient)
+                                .shadow(color: glowColor.opacity(isSpeaking ? 0.44 : 0.26), radius: isSpeaking ? 8 : 5)
+                            Circle()
+                                .fill(
+                                    RadialGradient(
+                                        colors: [.white.opacity(0.58), .white.opacity(0.10), .clear],
+                                        center: UnitPoint(x: 0.34, y: 0.25),
+                                        startRadius: 0,
+                                        endRadius: size * 0.46
+                                    )
+                                )
+                            Circle()
+                                .stroke(.white.opacity(0.52), lineWidth: 1.15)
+                        }
+                        .scaleEffect(beat)
+                        .transition(.scale(scale: 0.58).combined(with: .opacity))
+                    } else {
+                        let breathe = 0.88 + CGFloat((sin(time * 2.7) + 1) * 0.04)
+                        ZStack {
+                            Circle()
+                                .trim(from: 0.04, to: 0.60)
+                                .stroke(
+                                    AngularGradient(
+                                        colors: [
+                                            Color(red: 0.34, green: 0.94, blue: 1.0).opacity(0.22),
+                                            Color(red: 0.46, green: 0.58, blue: 1.0),
+                                            Color(red: 0.86, green: 0.66, blue: 1.0).opacity(0.26),
+                                        ],
+                                        center: .center
+                                    ),
+                                    style: StrokeStyle(lineWidth: 7, lineCap: .round)
+                                )
+                                .rotationEffect(.degrees(time * 92))
+                            Circle()
+                                .trim(from: 0.12, to: 0.43)
+                                .stroke(
+                                    LinearGradient(
+                                        colors: [.white.opacity(0.84), Color.cyan.opacity(0.22)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    ),
+                                    style: StrokeStyle(lineWidth: 3.5, lineCap: .round)
+                                )
+                                .padding(size * 0.13)
+                                .rotationEffect(.degrees(-time * 128))
+                            Circle()
+                                .fill(
+                                    RadialGradient(
+                                        colors: [
+                                            Color.white.opacity(0.34),
+                                            Color(red: 0.38, green: 0.52, blue: 1.0).opacity(0.16),
+                                            .clear,
+                                        ],
+                                        center: .center,
+                                        startRadius: 0,
+                                        endRadius: size * 0.30
+                                    )
+                                )
+                                .padding(size * 0.21)
+                                .scaleEffect(breathe)
+                        }
+                        .scaleEffect(breathe)
+                        .transition(.scale(scale: 0.78).combined(with: .opacity))
+                    }
                 }
                 .padding(size * 0.10)
-                .scaleEffect(beat)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(.spring(response: 0.44, dampingFraction: 0.62), value: isReady)
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(isSpeaking ? "Assistant speaking" : (isListening ? "Listening" : "Assistant idle"))
+        .accessibilityLabel(
+            !isReady ? "Assistant connecting" : (isSpeaking ? "Assistant speaking" : (isListening ? "Listening" : "Assistant idle"))
+        )
     }
 
     private var glowColor: Color {
