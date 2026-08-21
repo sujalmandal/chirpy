@@ -682,6 +682,7 @@ class Agent:
             f"turn={self.current_turn_id or '-'} owner=user state=barge_in_detected "
             f"evidence=sustained_residual_energy mic_rms={rms:.4f} "
             f"threshold={threshold:.4f} played_rms={played:.4f} "
+            f"coupling={self.coupling_k if self.coupling_k is not None else 'unavailable'} "
             f"required_ms={self.barge_gate.required_blocks * self.barge_gate.block_ms}"
         )
         await self._cancel_current_turn("vad_barge_in", "user", reset_stt=True)
@@ -763,7 +764,10 @@ class Agent:
                         self.coupling_k * echo_reference * self.barge_echo_multiplier,
                     )
                 residual_confirmed = self.barge_gate.observe(
-                    elapsed_ms=elapsed * 1000.0, rms=rms, threshold=threshold
+                    elapsed_ms=elapsed * 1000.0,
+                    rms=rms,
+                    threshold=threshold,
+                    calibrated=self.coupling_k is not None,
                 )
                 if residual_confirmed:
                     self.barge_energy_confirmed_until = time.time() + 1.2

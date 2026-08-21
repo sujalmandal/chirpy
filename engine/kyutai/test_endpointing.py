@@ -162,6 +162,20 @@ class BargeInGateTests(unittest.TestCase):
             gate.observe(elapsed_ms=index * 80, rms=0.09, threshold=0.05)
         self.assertEqual(gate.run, 0)
 
+    def test_uncalibrated_echo_cannot_trigger_energy_barge_in(self):
+        gate = BargeInGate(blind_ms=1200, min_speech_ms=640)
+        results = [
+            gate.observe(
+                elapsed_ms=1200 + index * 80,
+                rms=0.09,
+                threshold=0.05,
+                calibrated=False,
+            )
+            for index in range(12)
+        ]
+        self.assertFalse(any(results))
+        self.assertEqual(gate.run, 0)
+
 
 class PlaybackEchoTests(unittest.TestCase):
     def test_exact_reply_fragment_is_echo(self):

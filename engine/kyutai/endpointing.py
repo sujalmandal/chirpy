@@ -219,8 +219,11 @@ class BargeInGate:
     def reset(self) -> None:
         self.run = 0
 
-    def observe(self, *, elapsed_ms: float, rms: float, threshold: float) -> bool:
-        if elapsed_ms < self.blind_ms or rms <= threshold:
+    def observe(
+        self, *, elapsed_ms: float, rms: float, threshold: float,
+        calibrated: bool = True,
+    ) -> bool:
+        if not calibrated or elapsed_ms < self.blind_ms or rms <= threshold:
             self.run = 0
             return False
         self.run += 1
