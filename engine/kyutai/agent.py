@@ -73,7 +73,10 @@ async def entrypoint(ctx: JobContext):
         ),
         turn_handling={
             "turn_detection": TurnDetector(),
-            "interruption": {"enabled": True},
+            # Barge-in is disabled: the client plays the agent's TTS through the
+            # speakers, and without reliable echo cancellation the mic picks that
+            # audio back up, causing the agent to interrupt its own speech.
+            "interruption": {"enabled": False},
         },
     )
 

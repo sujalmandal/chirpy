@@ -96,6 +96,7 @@ class VoiceSession {
   private listening = false;
   private speaking = false;
   private outputMuted = false;
+  private playbackEls: HTMLAudioElement[] = [];
   private reply = "";
   private transcript = "";
 
@@ -163,6 +164,8 @@ class VoiceSession {
     this.onSpeaking(false);
     this.room?.disconnect();
     this.room = null;
+    this.playbackEls.forEach((el) => el.remove());
+    this.playbackEls = [];
     this.audioCtx?.close();
     this.audioCtx = null;
     this.onStatus("Conversation stopped");
@@ -177,6 +180,7 @@ class VoiceSession {
 
   toggleOutputMuted() {
     this.outputMuted = !this.outputMuted;
+    this.playbackEls.forEach((el) => (el.muted = this.outputMuted));
     if (this.room) {
       this.room.remoteParticipants.forEach((p) => {
         p.audioTrackPublications.forEach((pub) => pub.setSubscribed(!this.outputMuted));
@@ -185,13 +189,16 @@ class VoiceSession {
   }
 
   private attachPlayback(track: Track) {
-    if (!this.audioCtx) return;
-    const mediaTrack = track.mediaStreamTrack;
-    const src = this.audioCtx.createMediaStreamSource(new MediaStream([mediaTrack]));
-    const gain = this.audioCtx.createGain();
-    gain.gain.value = this.outputMuted ? 0 : 1;
-    src.connect(gain);
-    gain.connect(this.audioCtx.destination);
+    // Play the agent's audio through an <audio> element (not Web Audio) so the
+    // browser's echo canceller includes it as a reference and cancels it from
+    // the microphone, preventing the agent from hearing its own speech.
+    const el = document.createElement("audio");
+    el.srcObject = new MediaStream([track.mediaStreamTrack]);
+    el.autoplay = true;
+    el.muted = this.outputMuted;
+    el.style.display = "none";
+    document.body.appendChild(el);
+    this.playbackEls.push(el);
   }
 
   private handleData(payload: Uint8Array) {
