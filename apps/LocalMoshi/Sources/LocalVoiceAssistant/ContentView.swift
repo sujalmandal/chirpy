@@ -197,6 +197,10 @@ private struct VoiceOrb: View {
                             Circle()
                                 .fill(orbGradient)
                                 .shadow(color: glowColor.opacity(isSpeaking ? 0.44 : 0.26), radius: isSpeaking ? 8 : 5)
+                            if isListening && !isSpeaking {
+                                ListeningGasCloud(time: time, size: size)
+                                    .transition(.opacity)
+                            }
                             Circle()
                                 .fill(
                                     RadialGradient(
@@ -299,6 +303,62 @@ private struct VoiceOrb: View {
             ]
         }
         return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+private struct ListeningGasCloud: View {
+    let time: Double
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            ForEach(0..<5, id: \.self) { index in
+                let phase = time * (0.62 + Double(index) * 0.07) + Double(index) * 1.37
+                let diameter = size * (0.34 + CGFloat(index % 3) * 0.07)
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                index.isMultiple(of: 2) ? Color.white.opacity(0.52) : Color.cyan.opacity(0.46),
+                                Color(red: 0.52, green: 0.82, blue: 1.0).opacity(0.25),
+                                .clear,
+                            ],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: diameter * 0.52
+                        )
+                    )
+                    .frame(width: diameter, height: diameter)
+                    .blur(radius: 6 + CGFloat(index) * 0.7)
+                    .scaleEffect(0.92 + CGFloat(sin(phase * 0.73)) * 0.10)
+                    .offset(
+                        x: CGFloat(sin(phase)) * size * 0.13,
+                        y: CGFloat(cos(phase * 0.81)) * size * 0.11
+                    )
+                    .blendMode(.screen)
+            }
+            Ellipse()
+                .fill(
+                    LinearGradient(
+                        colors: [.clear, Color.white.opacity(0.28), Color.cyan.opacity(0.18), .clear],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(width: size * 0.72, height: size * 0.19)
+                .blur(radius: 4)
+                .rotationEffect(.degrees(sin(time * 0.68) * 38 - 18))
+                .offset(
+                    x: CGFloat(cos(time * 0.58)) * size * 0.07,
+                    y: CGFloat(sin(time * 0.54)) * size * 0.13
+                )
+                .blendMode(.screen)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .mask(Circle())
+        .opacity(0.96)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
