@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { load } from "@tauri-apps/plugin-store";
 import { Room, RoomEvent, Track } from "livekit-client";
@@ -495,8 +496,12 @@ async function pollStatus() {
     else if (status.ready) el.textContent = "Chirpy ready";
     else el.textContent = "Loading models…";
   }
-  if (status.ready && !session.isListening) session.start();
-  if (!status.ready && session.isListening) session.stop();
+  // Only the main window drives the voice session; the debug window just
+  // observes status and the conversation via events.
+  if (!isDebug) {
+    if (status.ready && !session.isListening) session.start();
+    if (!status.ready && session.isListening) session.stop();
+  }
 }
 
 async function pollMetrics() {
@@ -526,16 +531,18 @@ async function init() {
     setInterval(pollStatus, 1000);
     setInterval(pollMetrics, 1000);
     setInterval(pollLogs, 1000);
-    session.onUserMessage = (text) => {
-      messages.push({ role: "user", text, time: now(), state: "completed" });
+    // The debug window observes the conversation via events broadcast by the
+    // main window (which owns the voice session).
+    listen("conversation-user", (e) => {
+      messages.push({ role: "user", text: e.payload as string, time: now(), state: "completed" });
       appendMessage(messages[messages.length - 1]);
-    };
-    session.onAssistantStart = () => {
+    });
+    listen("conversation-assistant-start", () => {
       messages.push({ role: "assistant", text: "", time: now(), state: "streaming" });
       appendMessage(messages[messages.length - 1]);
-    };
-    session.onAssistantDelta = (delta) => updateLastAssistant(delta);
-    session.onAssistantEnd = () => finishLastAssistant();
+    });
+    listen("conversation-assistant-delta", (e) => updateLastAssistant(e.payload as string));
+    listen("conversation-assistant-end", () => finishLastAssistant());
     session.onStatus = (s) => {
       const el = document.getElementById("status");
       if (el) el.textContent = s;
@@ -560,6 +567,11 @@ async function init() {
       const orb = document.getElementById("orb");
       if (orb) orb.classList.toggle("listening", b);
     };
+    // Broadcast the conversation to the debug window.
+    session.onUserMessage = (text) => emit("conversation-user", text);
+    session.onAssistantStart = () => emit("conversation-assistant-start", null);
+    session.onAssistantDelta = (delta) => emit("conversation-assistant-delta", delta);
+    session.onAssistantEnd = () => emit("conversation-assistant-end", null);
     setInterval(pollStatus, 1000);
   }
 }
