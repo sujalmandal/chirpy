@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
@@ -99,7 +100,9 @@ private struct AssistantView: View {
             compactButton(icon: session.isListening ? "mic.fill" : "mic.slash.fill", help: session.isListening ? "Mute microphone" : "Unmute microphone") {
                 session.isListening ? session.stop() : session.start()
             }
-            compactButton(icon: "xmark", help: "End conversation") { session.stop() }
+            compactButton(icon: "xmark", help: "Quit Local Voice Assistant") {
+                NSApplication.shared.terminate(nil)
+            }
             compactButton(icon: session.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill", help: session.isOutputMuted ? "Unmute speaker" : "Mute speaker") {
                 session.toggleOutputMuted()
             }
