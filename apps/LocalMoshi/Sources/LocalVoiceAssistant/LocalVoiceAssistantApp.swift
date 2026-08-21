@@ -5,15 +5,27 @@ struct LocalMoshiApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var engine = KyutaiEngine()
     @StateObject private var settings = AppSettings()
+    @StateObject private var session = KyutaiSession()
+    @StateObject private var metrics = SystemMetrics()
 
     var body: some Scene {
-        WindowGroup("Local Moshi") {
+        Window("Local Voice Assistant", id: "assistant") {
             ContentView()
                 .environmentObject(engine)
                 .environmentObject(settings)
-                .frame(minWidth: 980, minHeight: 720)
+                .environmentObject(session)
+                .environmentObject(metrics)
+                .frame(width: 320, height: 360)
         }
         .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultSize(width: 320, height: 360)
+
+        Window("Voice Assistant Debug", id: "debug") {
+            DebugDashboardView(session: session, engine: engine, metrics: metrics)
+                .environmentObject(settings)
+                .frame(minWidth: 980, minHeight: 720)
+        }
         .defaultSize(width: 1080, height: 780)
     }
 }
@@ -23,7 +35,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
-            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+            guard let window = NSApp.windows.first(where: { $0.title == "Local Voice Assistant" }) else { return }
+            window.standardWindowButton(.closeButton)?.isHidden = true
+            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+            window.standardWindowButton(.zoomButton)?.isHidden = true
+            window.isMovableByWindowBackground = true
+            window.level = .floating
+            window.collectionBehavior.insert(.fullScreenAuxiliary)
+            window.makeKeyAndOrderFront(nil)
         }
     }
 

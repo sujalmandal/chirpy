@@ -3,31 +3,11 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var engine: KyutaiEngine
     @EnvironmentObject private var settings: AppSettings
-    @StateObject private var session = KyutaiSession()
-    @StateObject private var metrics = SystemMetrics()
+    @EnvironmentObject private var session: KyutaiSession
+    @EnvironmentObject private var metrics: SystemMetrics
 
     var body: some View {
-        ZStack {
-            if settings.mode == .assistant {
-                AssistantView(session: session, engine: engine)
-                    .transition(.opacity.combined(with: .scale(scale: 0.985)))
-            } else {
-                DebugDashboardView(session: session, engine: engine, metrics: metrics)
-                    .transition(.opacity)
-            }
-        }
-        .animation(.easeInOut(duration: 0.22), value: settings.mode)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                Picker("Mode", selection: $settings.mode) {
-                    ForEach(AppMode.allCases) { mode in
-                        Label(mode.title, systemImage: mode.icon).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 220)
-            }
-        }
+        AssistantView(session: session, engine: engine)
         .task {
             engine.startIfNeeded(configuration: settings.engineEnvironment)
             metrics.start(engine: engine)
@@ -46,136 +26,63 @@ private struct AssistantView: View {
     @ObservedObject var session: KyutaiSession
     @ObservedObject var engine: KyutaiEngine
     @EnvironmentObject private var settings: AppSettings
-    @State private var showSettings = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.055, green: 0.06, blue: 0.075), Color(red: 0.025, green: 0.028, blue: 0.038)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                header
-                Spacer(minLength: 20)
+            Color(red: 0.075, green: 0.078, blue: 0.082).ignoresSafeArea()
+            VStack(spacing: 16) {
                 VoiceOrb(
                     micLevel: session.micLevel,
                     speakerLevel: session.speakerLevel,
                     active: session.isListening || session.isSpeaking
                 )
-                .frame(width: 270, height: 270)
-
-                VStack(spacing: 8) {
-                    Text(primaryStatus)
-                        .font(.system(size: 22, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white)
-                    Text(secondaryStatus)
-                        .font(.callout)
-                        .foregroundStyle(.white.opacity(0.55))
-                }
-                .padding(.top, 24)
-
-                transcriptPanel
-                    .frame(maxWidth: 720)
-                    .padding(.top, 22)
-
-                Spacer(minLength: 24)
+                .frame(width: 142, height: 142)
                 controls
-                    .padding(.bottom, 34)
             }
-            .padding(.horizontal, 34)
+            .offset(y: -4)
         }
-        .sheet(isPresented: $showSettings) {
-            SettingsView(engine: engine)
-                .environmentObject(settings)
-        }
-    }
-
-    private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(settings.agentName)
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                HStack(spacing: 6) {
-                    Circle().fill(engine.isReady ? .green : .orange).frame(width: 7, height: 7)
-                    Text(engine.isReady ? "On-device voice ready" : engine.status)
-                        .lineLimit(1)
-                }
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.5))
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button {
+                openWindow(id: "debug")
+            } label: {
+                Label("Open Debug Mode", systemImage: "wrench.and.screwdriver")
             }
-            Spacer()
-            Button { showSettings = true } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 15, weight: .semibold))
-                    .frame(width: 34, height: 34)
-                    .background(.white.opacity(0.09), in: Circle())
+            Divider()
+            Button {
+                settings.persistCredential()
+                engine.restart(configuration: settings.engineEnvironment)
+            } label: {
+                Label("Restart Voice Engine", systemImage: "arrow.clockwise")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white.opacity(0.82))
-            .help("Assistant settings")
         }
-        .padding(.top, 18)
-    }
-
-    @ViewBuilder private var transcriptPanel: some View {
-        if !session.transcript.isEmpty || !session.reply.isEmpty {
-            VStack(spacing: 10) {
-                if !session.transcript.isEmpty {
-                    Text(session.transcript)
-                        .font(.body)
-                        .foregroundStyle(.white.opacity(0.65))
-                        .lineLimit(2)
-                }
-                if !session.reply.isEmpty {
-                    Text(session.reply)
-                        .font(.system(size: 17, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.94))
-                        .multilineTextAlignment(.center)
-                        .lineLimit(4)
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 24)
-            .padding(.vertical, 16)
-            .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 18))
-            .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07), lineWidth: 1))
-        } else {
-            Text("Start speaking whenever you're ready")
-                .font(.callout)
-                .foregroundStyle(.white.opacity(0.42))
-        }
+        .accessibilityLabel("\(settings.agentName). \(primaryStatus). Right-click for Debug Mode.")
     }
 
     private var controls: some View {
-        HStack(spacing: 16) {
-            roundButton(icon: session.isListening ? "mic.fill" : "mic.slash.fill", label: session.isListening ? "Mute" : "Unmute") {
+        HStack(spacing: 12) {
+            compactButton(icon: session.isListening ? "mic.fill" : "mic.slash.fill", help: session.isListening ? "Mute microphone" : "Unmute microphone") {
                 session.isListening ? session.stop() : session.start()
             }
-            roundButton(icon: "hand.raised.fill", label: "Interrupt", destructive: session.isSpeaking) {
-                session.interrupt()
+            compactButton(icon: "xmark", help: "End conversation") { session.stop() }
+            compactButton(icon: session.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill", help: session.isOutputMuted ? "Unmute speaker" : "Mute speaker") {
+                session.toggleOutputMuted()
             }
-            .disabled(!session.isSpeaking)
-            roundButton(icon: "xmark", label: "End") { session.stop() }
         }
     }
 
-    private func roundButton(icon: String, label: String, destructive: Bool = false, action: @escaping () -> Void) -> some View {
+    private func compactButton(icon: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(spacing: 7) {
-                Image(systemName: icon)
-                    .font(.system(size: 18, weight: .semibold))
-                    .frame(width: 52, height: 52)
-                    .background(destructive ? Color.orange.opacity(0.8) : Color.white.opacity(0.1), in: Circle())
-                    .overlay(Circle().stroke(.white.opacity(0.08)))
-                Text(label).font(.caption2).foregroundStyle(.white.opacity(0.58))
-            }
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: 30, height: 30)
+                .background(Color.white.opacity(0.075), in: Circle())
+                .overlay(Circle().stroke(.white.opacity(0.16), lineWidth: 0.7))
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.white)
+        .foregroundStyle(.white.opacity(0.92))
+        .help(help)
     }
 
     private var primaryStatus: String {
@@ -185,12 +92,6 @@ private struct AssistantView: View {
         return "Conversation paused"
     }
 
-    private var secondaryStatus: String {
-        if !engine.isReady { return "Models load locally and stay on your Mac" }
-        if session.isSpeaking { return "You can interrupt at any time" }
-        if session.isListening { return "Speak naturally — no button press needed" }
-        return "Unmute when you want to continue"
-    }
 }
 
 private struct VoiceOrb: View {
@@ -199,45 +100,46 @@ private struct VoiceOrb: View {
     let active: Bool
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30)) { timeline in
-            let time = timeline.date.timeIntervalSinceReferenceDate
-            let level = CGFloat(min(max(micLevel * 7 + speakerLevel * 3, 0), 1))
-            ZStack {
-                Circle()
-                    .fill(Color.cyan.opacity(0.13))
-                    .blur(radius: 30)
-                    .scaleEffect(active ? 1.04 + level * 0.12 : 0.92)
-                ForEach(0..<5, id: \.self) { index in
-                    let phase = time * (0.75 + Double(index) * 0.07) + Double(index)
+        GeometryReader { geometry in
+            TimelineView(.animation(minimumInterval: 1 / 30)) { timeline in
+                let time = timeline.date.timeIntervalSinceReferenceDate
+                let level = CGFloat(min(max(micLevel * 7 + speakerLevel * 3, 0), 1))
+                let size = min(geometry.size.width, geometry.size.height)
+                ZStack {
                     Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.18, green: 0.72, blue: 0.96).opacity(0.68),
-                                    Color(red: 0.50, green: 0.32, blue: 0.95).opacity(0.56),
-                                    Color(red: 0.10, green: 0.92, blue: 0.76).opacity(0.45),
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
+                        .fill(Color.indigo.opacity(0.30))
+                        .frame(width: size * 0.78, height: size * 0.78)
+                        .blur(radius: size * 0.13)
+                        .scaleEffect(active ? 1.0 + level * 0.12 : 0.92)
+                    ForEach(0..<4, id: \.self) { index in
+                        let phase = time * (0.72 + Double(index) * 0.08) + Double(index)
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color(red: 0.92, green: 0.95, blue: 1.0).opacity(0.92),
+                                        Color(red: 0.48, green: 0.57, blue: 1.0).opacity(0.72),
+                                        Color(red: 0.70, green: 0.88, blue: 1.0).opacity(0.76),
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
                             )
-                        )
-                        .frame(width: 185 + CGFloat(index * 8), height: 185 + CGFloat(index * 5))
-                        .blur(radius: CGFloat(10 + index * 3))
-                        .offset(
-                            x: CGFloat(sin(phase)) * CGFloat(8 + index * 2) * (1 + level),
-                            y: CGFloat(cos(phase * 0.83)) * CGFloat(7 + index) * (1 + level)
-                        )
-                        .scaleEffect(1 + level * (0.08 + CGFloat(index) * 0.018))
-                        .blendMode(.screen)
+                            .frame(width: size * (0.55 + CGFloat(index) * 0.025), height: size * (0.55 + CGFloat(index) * 0.018))
+                            .blur(radius: size * (0.025 + CGFloat(index) * 0.012))
+                            .offset(
+                                x: CGFloat(sin(phase)) * size * 0.025 * (1 + level),
+                                y: CGFloat(cos(phase * 0.83)) * size * 0.022 * (1 + level)
+                            )
+                            .scaleEffect(1 + level * (0.04 + CGFloat(index) * 0.012))
+                            .blendMode(.screen)
+                    }
+                    Circle()
+                        .fill(.white.opacity(0.12))
+                        .frame(width: size * 0.51, height: size * 0.51)
+                        .overlay(Circle().stroke(.white.opacity(0.22), lineWidth: 0.7))
                 }
-                Circle()
-                    .fill(.ultraThinMaterial.opacity(0.22))
-                    .frame(width: 154, height: 154)
-                    .overlay(Circle().stroke(.white.opacity(0.22), lineWidth: 1))
-                Image(systemName: active ? "waveform" : "sparkles")
-                    .font(.system(size: 42, weight: .light))
-                    .foregroundStyle(.white.opacity(0.92))
-                    .symbolEffect(.variableColor.iterative, isActive: active)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .accessibilityElement(children: .ignore)
@@ -245,7 +147,7 @@ private struct VoiceOrb: View {
     }
 }
 
-private struct DebugDashboardView: View {
+struct DebugDashboardView: View {
     @ObservedObject var session: KyutaiSession
     @ObservedObject var engine: KyutaiEngine
     @ObservedObject var metrics: SystemMetrics

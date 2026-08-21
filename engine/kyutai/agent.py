@@ -64,6 +64,9 @@ class TurnCancelled(Exception):
 MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
 
 LOG_PATH = ROOT / "logs" / "kyutai-agent.log"
+LOG_BACKUP_PATH = ROOT / "logs" / "kyutai-agent.log.1"
+LOG_MAX_BYTES = 2_000_000
+LOG_LOCK = threading.Lock()
 
 DEBUG = False
 
@@ -76,9 +79,14 @@ def log(message: str) -> None:
     """
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n"
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "a") as fobj:
-            fobj.write(line)
+        with LOG_LOCK:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
+                if LOG_BACKUP_PATH.exists():
+                    LOG_BACKUP_PATH.unlink()
+                LOG_PATH.replace(LOG_BACKUP_PATH)
+            with open(LOG_PATH, "a") as fobj:
+                fobj.write(line)
     except OSError:
         pass
     try:
@@ -165,15 +173,16 @@ def stream_chat(text: str, session_id: str, config: dict[str, str]):
 # ---------------------------------------------------------------------------
 
 _READY = {"stt_ready": False, "tts_ready": False, "config": {}}
+_READY.update({"stt_error": None, "stt_error_count": 0, "stt_last_recovery": None})
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     server_version = "LocalVoiceAgent/0.2"
 
     def log_message(self, format: str, *args: object) -> None:
-        # File-backed and exception-safe so a broken stdout never aborts a
-        # response (send_response() logs before writing the body).
-        log(format % args)
+        # Health is polled continuously by the macOS app. Logging every request
+        # would add thousands of low-value lines per hour.
+        return
 
     def do_GET(self) -> None:
         if self.path != "/health":
@@ -190,6 +199,9 @@ class HealthHandler(BaseHTTPRequestHandler):
             "vad_model": cfg.get("VAD_REPO", cfg.get("STT_REPO", "")),
             "stt_model": cfg.get("STT_REPO", ""),
             "tts_model": cfg.get("TTS_REPO", ""),
+            "stt_error": _READY["stt_error"],
+            "stt_error_count": _READY["stt_error_count"],
+            "stt_last_recovery": _READY["stt_last_recovery"],
         }
         body = json.dumps(payload).encode()
         self.send_response(200)
@@ -224,7 +236,13 @@ class SpeechToText:
         generated_codebooks = lm_config.generated_codebooks
         self.other_codebooks = lm_config.other_codebooks
         num_codebooks = max(generated_codebooks, self.other_codebooks)
-        self.audio_tokenizer = rustymimi.Tokenizer(str(mimi_weights), num_codebooks=num_codebooks)
+        self.mimi_weights = str(mimi_weights)
+        self.num_codebooks = num_codebooks
+        self.audio_tokenizer = self._new_audio_tokenizer()
+        # rustymimi advances more than one internal position for some audio
+        # blocks. Rotate well before its fixed 8192-position RoPE table fills.
+        self.rotate_blocks = max(500, int(config.get("STT_ROTATE_BLOCKS", "3000")))
+        self.blocks_since_hard_reset = 0
         log("STT: warming up")
         self.lm.warmup()
         self.buffer = bytearray()
@@ -239,18 +257,29 @@ class SpeechToText:
             check=False,
         )
 
-    def reset(self):
-        self.gen = self._new_gen()
-        self.buffer = bytearray()
-        self.audio_tokenizer.reset()
-        # The Lm model keeps a KV cache shared across LmGen instances; it must be
-        # cleared too or the next step overflows its fixed max_seq_len window and
-        # every block errors with "narrow invalid args" (the stall where speech is
-        # no longer transcribed).
+    def _new_audio_tokenizer(self):
+        return rustymimi.Tokenizer(self.mimi_weights, num_codebooks=self.num_codebooks)
+
+    def reset(self, hard: bool = False):
+        # Clear model caches before constructing the next generator. Reversing
+        # this order can leave the new LmGen attached to state from the old turn.
         for c in self.lm.transformer_cache:
             c.reset()
         for c in self.lm.depformer_cache:
             c.reset()
+        self.buffer = bytearray()
+        if hard:
+            # rustymimi.Tokenizer.reset() does not reliably recover after its
+            # internal positional context has overflowed. Recreate the tokenizer
+            # from the already-cached weights for a true streaming-state reset.
+            self.audio_tokenizer = self._new_audio_tokenizer()
+            self.blocks_since_hard_reset = 0
+        else:
+            self.audio_tokenizer.reset()
+        self.gen = self._new_gen()
+
+    def should_rotate(self) -> bool:
+        return self.blocks_since_hard_reset >= self.rotate_blocks
 
     def step(self, pcm_float32: bytes) -> tuple[str | None, float]:
         """Feed arbitrary-size PCM bytes; returns (new text fragment, VAD prob).
@@ -276,6 +305,7 @@ class SpeechToText:
         vad_prob = 0.0
         if extra_heads and len(extra_heads) > 2:
             vad_prob = extra_heads[2][0, 0, 0].item()
+        self.blocks_since_hard_reset += 1
         return fragment, vad_prob
 
 
@@ -370,6 +400,7 @@ class TextToSpeech:
 # ---------------------------------------------------------------------------
 
 class Agent:
+    active_session_id: str | None = None
     def __init__(self, config: dict[str, str], websocket):
         self.config = config
         self.ws = websocket
@@ -400,6 +431,9 @@ class Agent:
         self.min_speech_blocks = max(1, round(float(config.get("VAD_MIN_SPEECH_MS", "320")) / 80))
         self.min_silence_blocks = max(1, round(float(config.get("VAD_MIN_SILENCE_MS", "320")) / 80))
         self.semantic_threshold = min(1.0, max(0.0, float(config.get("VAD_SEMANTIC_THRESHOLD", "0.6"))))
+        self.stt_error_streak = 0
+        self.stt_suppressed_errors = 0
+        self.stt_last_error_log = 0.0
 
     async def send_event(self, **payload):
         await self.ws.send(json.dumps(payload))
@@ -471,6 +505,8 @@ class Agent:
         semantic_pause_run = 0
         grace_until = 0.0
         while True:
+            if self.session_id != Agent.active_session_id:
+                return
             try:
                 pcm = await asyncio.wait_for(self.mic_queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
@@ -546,13 +582,37 @@ class Agent:
             try:
                 fragment, vad_probability = await self._mlx(stt.step, pcm)
             except Exception as error:
-                log(f"STT step error: {error}")
-                await self._mlx(stt.reset)
+                self.stt_error_streak += 1
+                _READY["stt_ready"] = False
+                _READY["stt_error"] = str(error)
+                _READY["stt_error_count"] += 1
+                now = time.time()
+                if self.stt_last_error_log == 0.0 or now - self.stt_last_error_log >= 10.0:
+                    suffix = f" ({self.stt_suppressed_errors} repeated errors suppressed)" if self.stt_suppressed_errors else ""
+                    log(f"STT step error: {error}{suffix}; performing hard recovery")
+                    self.stt_last_error_log = now
+                    self.stt_suppressed_errors = 0
+                else:
+                    self.stt_suppressed_errors += 1
+                try:
+                    await self._mlx(stt.reset, True)
+                    _READY["stt_last_recovery"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                except Exception as reset_error:
+                    _READY["stt_error"] = f"Recovery failed: {reset_error}"
+                    log(f"STT hard recovery failed: {reset_error}")
+                    await asyncio.sleep(1.0)
                 fragments.clear()
                 speech_run = 0
                 silence_run = 0
                 semantic_pause_run = 0
                 continue
+            if self.stt_error_streak:
+                log(f"STT recovered after {self.stt_error_streak} failed block(s)")
+                self.stt_error_streak = 0
+                self.stt_suppressed_errors = 0
+                self.stt_last_error_log = 0.0
+                _READY["stt_error"] = None
+                _READY["stt_ready"] = True
             if fragment:
                 fragments.append(fragment)
                 partial = "".join(fragments).strip()
@@ -571,7 +631,12 @@ class Agent:
             # idle silence too, so reset it during long silences to avoid the
             # "narrow invalid args" overflow that would otherwise stall listening
             # after ~11 minutes.
-            if silence_run >= 120 and not fragments:
+            if stt.should_rotate() and not fragments:
+                await self._mlx(stt.reset, True)
+                log("STT context rotated before positional limit")
+                speech_run = 0
+                silence_run = 0
+            elif silence_run >= 120 and not fragments:
                 await self._mlx(stt.reset)
                 speech_run = 0
                 silence_run = 0
@@ -696,11 +761,14 @@ class Agent:
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
+        Agent.active_session_id = self.session_id
         stt_task = asyncio.create_task(self.stt_loop())
         writer_task = asyncio.create_task(self.out_writer())
         try:
             async for message in self.ws:
                 if isinstance(message, bytes):
+                    if self.session_id != Agent.active_session_id:
+                        continue
                     if self.mic_queue.full():
                         self.mic_queue.get_nowait()
                     self.mic_queue.put_nowait(message)
@@ -727,6 +795,8 @@ class Agent:
             writer_task.cancel()
             if self.current_turn and not self.current_turn.done():
                 self.current_turn.cancel()
+            if Agent.active_session_id == self.session_id:
+                Agent.active_session_id = None
             HISTORY.pop(self.session_id, None)
 
 

@@ -4,10 +4,10 @@ Local Voice Assistant is a private, real-time voice assistant for Apple
 Silicon Macs. It pairs a native SwiftUI app with fully local, on-device speech
 models from Kyutai and an OpenAI-compatible cloud reasoning model.
 
-The app opens in **Assistant** mode: a focused, voice-first experience inspired
-by ChatGPT Voice for macOS. Switch the toolbar control to **Debug** to inspect
-metrics and logs or configure each stage of the `VAD → STT → LLM → TTS`
-pipeline.
+The app opens as a compact, floating voice control inspired by ChatGPT Voice
+for macOS. Right-click the window and choose **Open Debug Mode** to open the
+full dashboard, inspect metrics and logs, or configure each stage of the
+`VAD → STT → LLM → TTS` pipeline.
 
 ```text
 Swift macOS app
@@ -68,7 +68,8 @@ the STT/TTS/LLM providers can be swapped without touching the Swift UI.
 
 ## Configuring the pipeline
 
-Open **Debug** mode and select any pipeline card. VAD, STT, and TTS include a
+Right-click the compact assistant and open **Debug Mode**, then select any
+pipeline card. VAD, STT, and TTS include a
 Hugging Face model browser; LLM accepts an OpenAI-compatible endpoint, model
 name, and optional API key. The built-in Apple Silicon adapters currently load
 Kyutai delayed-stream STT/TTS checkpoints. Other Hugging Face repositories can

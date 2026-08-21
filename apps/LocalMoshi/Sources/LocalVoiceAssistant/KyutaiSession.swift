@@ -8,6 +8,7 @@ final class KyutaiSession: NSObject, ObservableObject {
     @Published private(set) var reply = ""
     @Published private(set) var isListening = false
     @Published private(set) var isSpeaking = false
+    @Published private(set) var isOutputMuted = false
     @Published private(set) var micLevel: Float = 0
     @Published private(set) var speakerLevel: Float = 0
 
@@ -121,6 +122,17 @@ final class KyutaiSession: NSObject, ObservableObject {
         pendingBuffers = 0
         turnDone = false
         isSpeaking = false; status = "Listening…"
+    }
+
+    func toggleOutputMuted() {
+        isOutputMuted.toggle()
+        if isOutputMuted {
+            player.stop()
+            pendingBuffers = 0
+            speakerLevel = 0
+        } else if isListening {
+            status = "Listening — speak naturally"
+        }
     }
 
     private func handleLevel(_ level: Float) {
@@ -245,6 +257,7 @@ final class KyutaiSession: NSObject, ObservableObject {
     }
 
     private func playPCM(_ data: Data) {
+        guard !isOutputMuted else { return }
         let frames = data.count / MemoryLayout<Float>.size
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: AVAudioFrameCount(frames)), let samples = buffer.floatChannelData else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
