@@ -1,6 +1,27 @@
 @preconcurrency import AVFoundation
 import Foundation
 
+enum VoiceChatRole: String {
+    case user = "You"
+    case assistant = "Assistant"
+}
+
+enum VoiceTurnState: Equatable {
+    case streaming
+    case completed
+    case cancelled(String)
+    case failed(String)
+}
+
+struct VoiceChatMessage: Identifiable, Equatable {
+    let id: UUID
+    var turnID: Int?
+    let role: VoiceChatRole
+    var text: String
+    let timestamp: Date
+    var state: VoiceTurnState
+}
+
 @MainActor
 final class KyutaiSession: NSObject, ObservableObject {
     @Published private(set) var status = "Waiting for microphone permission"
@@ -11,6 +32,7 @@ final class KyutaiSession: NSObject, ObservableObject {
     @Published private(set) var isOutputMuted = false
     @Published private(set) var micLevel: Float = 0
     @Published private(set) var speakerLevel: Float = 0
+    @Published private(set) var messages: [VoiceChatMessage] = []
 
     private let audioEngine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -29,6 +51,8 @@ final class KyutaiSession: NSObject, ObservableObject {
     private var sendTask: Task<Void, Never>?
     private var pendingBuffers = 0
     private var turnDone = false
+    private var pendingUserMessageID: UUID?
+    private var activeAssistantMessageID: UUID?
 
     override init() {
         recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
@@ -228,26 +252,122 @@ final class KyutaiSession: NSObject, ObservableObject {
             case "transcript":
                 transcript = event["text"] as? String ?? ""
                 reply = ""
+                finishUserMessage(
+                    text: transcript,
+                    turnID: event["turn_id"] as? Int,
+                    timestamp: eventDate(event)
+                )
             case "partial":
                 transcript = event["text"] as? String ?? ""
+                updateUserPartial(transcript, timestamp: eventDate(event))
             case "turn_started":
                 isSpeaking = true
                 turnDone = false
+                beginAssistantMessage(
+                    turnID: event["turn_id"] as? Int,
+                    timestamp: eventDate(event)
+                )
             case "text":
-                if let delta = event["delta"] as? String { reply += delta }
+                if let delta = event["delta"] as? String {
+                    reply += delta
+                    appendAssistantText(delta)
+                }
             case "done":
                 turnDone = true
-                if pendingBuffers <= 0 { isSpeaking = false; sendJSON(["type": "playback_done"]) }
+                if pendingBuffers <= 0 {
+                    finishAssistantMessage()
+                    isSpeaking = false
+                    sendJSON(["type": "playback_done"])
+                }
             case "interrupted":
                 player.stop()
                 pendingBuffers = 0
                 turnDone = false
                 isSpeaking = false
-            case "error": status = event["message"] as? String ?? "Agent error"
+                cancelAssistantMessage(reason: event["reason"] as? String ?? "interrupted")
+            case "error":
+                let message = event["message"] as? String ?? "Agent error"
+                status = message
+                failAssistantMessage(reason: message)
             default: break
             }
         default: break
         }
+    }
+
+    private func eventDate(_ event: [String: Any]) -> Date {
+        guard let timestamp = event["timestamp"] as? Double else { return Date() }
+        return Date(timeIntervalSince1970: timestamp)
+    }
+
+    private func updateUserPartial(_ text: String, timestamp: Date) {
+        if let id = pendingUserMessageID, let index = messages.firstIndex(where: { $0.id == id }) {
+            messages[index].text = text
+        } else {
+            let message = VoiceChatMessage(
+                id: UUID(), turnID: nil, role: .user, text: text,
+                timestamp: timestamp, state: .streaming
+            )
+            pendingUserMessageID = message.id
+            appendMessage(message)
+        }
+    }
+
+    private func finishUserMessage(text: String, turnID: Int?, timestamp: Date) {
+        if let id = pendingUserMessageID, let index = messages.firstIndex(where: { $0.id == id }) {
+            messages[index].text = text
+            messages[index].turnID = turnID
+            messages[index].state = .completed
+        } else {
+            appendMessage(
+                VoiceChatMessage(
+                    id: UUID(), turnID: turnID, role: .user, text: text,
+                    timestamp: timestamp, state: .completed
+                )
+            )
+        }
+        pendingUserMessageID = nil
+    }
+
+    private func beginAssistantMessage(turnID: Int?, timestamp: Date) {
+        let message = VoiceChatMessage(
+            id: UUID(), turnID: turnID, role: .assistant, text: "",
+            timestamp: timestamp, state: .streaming
+        )
+        activeAssistantMessageID = message.id
+        appendMessage(message)
+    }
+
+    private func appendAssistantText(_ delta: String) {
+        guard let id = activeAssistantMessageID,
+              let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[index].text += delta
+    }
+
+    private func finishAssistantMessage() {
+        guard let id = activeAssistantMessageID,
+              let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[index].state = .completed
+        activeAssistantMessageID = nil
+    }
+
+    private func cancelAssistantMessage(reason: String) {
+        guard let id = activeAssistantMessageID,
+              let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[index].state = .cancelled(reason)
+        activeAssistantMessageID = nil
+    }
+
+    private func failAssistantMessage(reason: String) {
+        guard let id = activeAssistantMessageID,
+              let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[index].state = .failed(reason)
+        activeAssistantMessageID = nil
+    }
+
+    private func appendMessage(_ message: VoiceChatMessage) {
+        messages.append(message)
+        if messages.count > 100 { messages.removeFirst(messages.count - 100) }
     }
 
     private func sendJSON(_ object: [String: Any]) {
@@ -277,6 +397,7 @@ final class KyutaiSession: NSObject, ObservableObject {
         if pendingBuffers <= 0 {
             speakerLevel = 0
             if turnDone {
+                finishAssistantMessage()
                 isSpeaking = false
                 sendJSON(["type": "playback_done"])
             }

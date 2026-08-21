@@ -90,7 +90,7 @@ def log(message: str) -> None:
     except OSError:
         pass
     try:
-        print(message, flush=True)
+        print(line.rstrip(), flush=True)
     except (BrokenPipeError, OSError):
         pass
 
@@ -401,6 +401,7 @@ class TextToSpeech:
 
 class Agent:
     active_session_id: str | None = None
+    next_turn_id = 0
     def __init__(self, config: dict[str, str], websocket):
         self.config = config
         self.ws = websocket
@@ -408,6 +409,7 @@ class Agent:
         self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
         self.tts_queue: asyncio.Queue = asyncio.Queue()
         self.current_turn: asyncio.Task | None = None
+        self.current_turn_id: int | None = None
         self.epoch = 0
         self.loop: asyncio.AbstractEventLoop | None = None
         self.playback_active = False
@@ -436,6 +438,7 @@ class Agent:
         self.stt_last_error_log = 0.0
 
     async def send_event(self, **payload):
+        payload.setdefault("timestamp", time.time())
         await self.ws.send(json.dumps(payload))
 
     async def _mlx(self, fn, *args):
@@ -479,17 +482,38 @@ class Agent:
                 break
         return best
 
-    async def _barge_in(self):
-        """Cancel the current turn and notify the client the user interrupted."""
+    async def _cancel_current_turn(self, reason: str, cancelled_by: str, reset_stt: bool = False):
+        """Cancel assistant generation/playback with an explicit audit reason."""
+        turn_id = self.current_turn_id
+        had_active_turn = self.playback_active or (self.current_turn is not None and not self.current_turn.done())
+        if not had_active_turn:
+            return
         self.cancel_flag = True
         self.epoch += 1
         self.playback_active = False
+        self.synthesizing = False
         if self.current_turn and not self.current_turn.done():
             self.current_turn.cancel()
-        await self.send_event(type="interrupted")
-        await self._mlx(Agent.stt.reset)
-        log(f"turn audio: {self.turn_audio_seconds:.1f} s ({self.turn_audio_bytes} bytes) — cancelled")
-        debug("barge-in: turn cancelled, STT reset")
+        await self.send_event(
+            type="interrupted",
+            turn_id=turn_id,
+            owner="assistant",
+            cancelled_by=cancelled_by,
+            reason=reason,
+        )
+        log(
+            f"turn={turn_id or '-'} owner=assistant state=cancelled "
+            f"by={cancelled_by} reason={reason} "
+            f"audio_seconds={self.turn_audio_seconds:.1f} audio_bytes={self.turn_audio_bytes}"
+        )
+        if reset_stt:
+            await self._mlx(Agent.stt.reset)
+        self.current_turn_id = None
+
+    async def _barge_in(self):
+        """Cancel the assistant because VAD detected user speech over playback."""
+        await self._cancel_current_turn("vad_barge_in", "user", reset_stt=True)
+        debug("barge-in: assistant turn cancelled, STT reset")
 
     async def stt_loop(self):
         """Consume mic PCM, detect end-of-turn, and handle barge-in.
@@ -643,6 +667,10 @@ class Agent:
             semantic_end = semantic_pause_run >= 2 and silence_run >= 1
             energy_end = speech_run >= self.min_speech_blocks and silence_run >= self.min_silence_blocks
             if semantic_end or energy_end:
+                endpoint_reason = "semantic_vad" if semantic_end else "silence_timeout"
+                endpoint_speech_ms = speech_run * 80
+                endpoint_silence_ms = silence_run * 80
+                endpoint_probability = vad_probability
                 transcript = await self._finalize(stt, fragments)
                 fragments = []
                 speech_run = 0
@@ -651,16 +679,27 @@ class Agent:
                 while not self.mic_queue.empty():
                     self.mic_queue.get_nowait()
                 if not transcript:
+                    log(
+                        "turn=- owner=user state=discarded reason=empty_transcript "
+                        f"endpoint={endpoint_reason} speech_ms={endpoint_speech_ms} "
+                        f"silence_ms={endpoint_silence_ms} vad_probability={endpoint_probability:.3f}"
+                    )
                     continue
                 # If a turn is still running (e.g. LLM still streaming), cancel
                 # it and start the new one with the fresh transcript.
                 if self.current_turn is not None and not self.current_turn.done():
-                    self.cancel_flag = True
-                    self.epoch += 1
-                    self.current_turn.cancel()
-                    await self.send_event(type="interrupted")
-                    debug("stt: superseded running turn with new transcript")
-                self.current_turn = asyncio.create_task(self.run_turn(transcript))
+                    await self._cancel_current_turn("new_user_turn_detected", "user")
+                Agent.next_turn_id += 1
+                turn_id = Agent.next_turn_id
+                self.current_turn_id = turn_id
+                log(
+                    f"turn={turn_id} owner=user state=completed endpoint={endpoint_reason} "
+                    f"speech_ms={endpoint_speech_ms} silence_ms={endpoint_silence_ms} "
+                    f"vad_probability={endpoint_probability:.3f} transcript={transcript!r}"
+                )
+                self.current_turn = asyncio.create_task(
+                    self.run_turn(transcript, turn_id, endpoint_reason)
+                )
 
     async def _finalize(self, stt, fragments: list[str]) -> str:
         """Feed trailing silence to flush the delayed STT output, then reset."""
@@ -671,7 +710,7 @@ class Agent:
         await self._mlx(stt.reset)
         return "".join(fragments).strip()
 
-    async def run_turn(self, transcript: str):
+    async def run_turn(self, transcript: str, turn_id: int, endpoint_reason: str):
         self.epoch += 1
         epoch = self.epoch
         self.cancel_flag = False
@@ -682,9 +721,12 @@ class Agent:
         self.last_k_update = 0.0
         self.turn_audio_bytes = 0
         self.turn_audio_seconds = 0.0
-        log(f"turn transcript: {transcript!r}")
-        await self.send_event(type="transcript", text=transcript)
-        await self.send_event(type="turn_started")
+        await self.send_event(
+            type="transcript", text=transcript, turn_id=turn_id,
+            owner="user", endpoint=endpoint_reason,
+        )
+        log(f"turn={turn_id} owner=assistant state=started reason=user_turn_completed")
+        await self.send_event(type="turn_started", turn_id=turn_id, owner="assistant")
         reply = ""
         try:
             async for delta in self._llm_stream_async(transcript):
@@ -693,25 +735,30 @@ class Agent:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            await self.send_event(type="error", message=str(error))
+            log(f"turn={turn_id} owner=assistant state=failed reason=llm_error error={error}")
+            await self.send_event(type="error", message=str(error), turn_id=turn_id, owner="assistant")
             return
         if not reply.strip():
-            await self.send_event(type="done")
+            log(f"turn={turn_id} owner=assistant state=completed reason=empty_llm_reply")
+            await self.send_event(type="done", turn_id=turn_id, owner="assistant")
             return
-        log(f"turn text: {len(reply)} chars")
+        log(f"turn={turn_id} owner=assistant state=reply_ready text_chars={len(reply)}")
         self.playback_active = True
         self.synthesizing = True
         self.playback_started = time.time()
-        log(f"turn flushed: {len(reply)} chars → TTS")
+        log(f"turn={turn_id} owner=assistant state=synthesizing text_chars={len(reply)}")
         try:
             await self._mlx(self._tts_synthesize, reply, epoch)
         except asyncio.CancelledError:
             raise
         except TurnCancelled:
-            debug("turn cancelled during TTS")
+            debug(f"turn={turn_id}: TTS observed cancellation flag")
             return
         except Exception as error:
-            await self.send_event(type="error", message=f"TTS: {error}")
+            log(f"turn={turn_id} owner=assistant state=failed reason=tts_error error={error}")
+            await self.send_event(
+                type="error", message=f"TTS: {error}", turn_id=turn_id, owner="assistant"
+            )
         self.synthesizing = False
         HISTORY.setdefault(self.session_id, []).extend(
             [{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}]
@@ -720,11 +767,12 @@ class Agent:
         self.session_audio_seconds += self.turn_audio_seconds
         self.session_text_chars += len(reply)
         log(
-            f"turn complete, reply={len(reply)} chars · "
-            f"turn audio: {self.turn_audio_seconds:.1f} s ({self.turn_audio_bytes} bytes) · "
-            f"session audio: {self.session_audio_seconds:.1f} s · session text: {self.session_text_chars} chars"
+            f"turn={turn_id} owner=assistant state=audio_ready reply_chars={len(reply)} "
+            f"audio_seconds={self.turn_audio_seconds:.1f} audio_bytes={self.turn_audio_bytes} "
+            f"session_audio_seconds={self.session_audio_seconds:.1f} "
+            f"session_text_chars={self.session_text_chars}"
         )
-        await self.send_event(type="done")
+        await self.send_event(type="done", turn_id=turn_id, owner="assistant")
 
     async def _llm_stream_async(self, transcript: str):
         """Bridge the synchronous `stream_chat` generator into async deltas."""
@@ -778,13 +826,14 @@ class Agent:
                     except json.JSONDecodeError:
                         continue
                     if event.get("type") == "interrupt":
-                        self.epoch += 1
-                        self.playback_active = False
-                        self.cancel_flag = True
-                        if self.current_turn and not self.current_turn.done():
-                            self.current_turn.cancel()
-                        await self._mlx(Agent.stt.reset)
+                        await self._cancel_current_turn("manual_interrupt", "user", reset_stt=True)
                     elif event.get("type") == "playback_done":
+                        if self.current_turn_id is not None:
+                            log(
+                                f"turn={self.current_turn_id} owner=assistant "
+                                "state=completed reason=playback_finished"
+                            )
+                            self.current_turn_id = None
                         self.playback_active = False
                         self.cancel_flag = False
                         await self._mlx(Agent.stt.reset)
@@ -795,6 +844,15 @@ class Agent:
             writer_task.cancel()
             if self.current_turn and not self.current_turn.done():
                 self.current_turn.cancel()
+                reason = (
+                    "session_superseded"
+                    if Agent.active_session_id not in (None, self.session_id)
+                    else "client_disconnected"
+                )
+                log(
+                    f"turn={self.current_turn_id or '-'} owner=assistant "
+                    f"state=cancelled by=system reason={reason}"
+                )
             if Agent.active_session_id == self.session_id:
                 Agent.active_session_id = None
             HISTORY.pop(self.session_id, None)
