@@ -79,7 +79,7 @@ final class AppSettings: ObservableObject {
         let name = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
         return [
             "AGENT_NAME": name,
-            "ASSISTANT_SYSTEM": "Your name is \(name). \(systemPrompt)",
+            "ASSISTANT_SYSTEM": "You are \(name), the voice assistant. \(name) is your name, never the user's name. The user's name is unknown unless they explicitly provide it. Never greet or address the user as \(name). \(systemPrompt)",
             "VAD_REPO": FixedVoicePipeline.vadRepo,
             "VAD_THRESHOLD": String(FixedVoicePipeline.vadThreshold),
             "VAD_MIN_SPEECH_MS": String(FixedVoicePipeline.minSpeechMS),
