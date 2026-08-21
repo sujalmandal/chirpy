@@ -35,6 +35,7 @@ final class AppSettings: ObservableObject {
         static let llmURL = "pipeline.llm.url"
         static let llmModel = "pipeline.llm.model"
         static let systemPrompt = "agent.systemPrompt"
+        static let systemPromptVersion = "agent.systemPrompt.version"
     }
 
     private enum FixedVoicePipeline {
@@ -50,6 +51,9 @@ final class AppSettings: ObservableObject {
     }
 
     private let defaults = UserDefaults.standard
+    private static let promptVersion = 2
+    private static let defaultBehavior = "Be concise, warm, and natural. Prefer short spoken answers unless the user asks for detail."
+    private static let identityPrompt = "You are {{agent_name}}, the voice assistant. {{agent_name}} is your name, never the user's name. The user's name is unknown unless they explicitly provide it. Never greet or address the user as {{agent_name}}."
 
     @Published var mode: AppMode { didSet { defaults.set(mode.rawValue, forKey: Key.mode) } }
     @Published var agentName: String { didSet { defaults.set(agentName, forKey: Key.agentName) } }
@@ -64,7 +68,15 @@ final class AppSettings: ObservableObject {
         llmURL = defaults.string(forKey: Key.llmURL) ?? "http://localhost:1234/v1"
         llmModel = defaults.string(forKey: Key.llmModel) ?? "liquid/lfm2.5-1.2b"
         llmAPIKey = KeychainStore.read(account: "llm-api-key") ?? ""
-        systemPrompt = defaults.string(forKey: Key.systemPrompt) ?? "Be concise, warm, and natural. Prefer short spoken answers unless the user asks for detail."
+        let storedPrompt = defaults.string(forKey: Key.systemPrompt)
+        if defaults.integer(forKey: Key.systemPromptVersion) < Self.promptVersion {
+            let previousBehavior = storedPrompt ?? Self.defaultBehavior
+            systemPrompt = "\(Self.identityPrompt)\n\n\(previousBehavior)"
+            defaults.set(systemPrompt, forKey: Key.systemPrompt)
+            defaults.set(Self.promptVersion, forKey: Key.systemPromptVersion)
+        } else {
+            systemPrompt = storedPrompt ?? "\(Self.identityPrompt)\n\n\(Self.defaultBehavior)"
+        }
     }
 
     var validationIssues: [String] {
@@ -77,9 +89,13 @@ final class AppSettings: ObservableObject {
 
     var engineEnvironment: [String: String] {
         let name = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedSystemPrompt = systemPrompt.replacingOccurrences(
+            of: "{{agent_name}}",
+            with: name
+        )
         return [
             "AGENT_NAME": name,
-            "ASSISTANT_SYSTEM": "You are \(name), the voice assistant. \(name) is your name, never the user's name. The user's name is unknown unless they explicitly provide it. Never greet or address the user as \(name). \(systemPrompt)",
+            "ASSISTANT_SYSTEM": resolvedSystemPrompt,
             "VAD_REPO": FixedVoicePipeline.vadRepo,
             "VAD_THRESHOLD": String(FixedVoicePipeline.vadThreshold),
             "VAD_MIN_SPEECH_MS": String(FixedVoicePipeline.minSpeechMS),

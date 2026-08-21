@@ -78,7 +78,7 @@ macOS requests microphone access on first launch. A changed bundle identifier or
 Right-click the floating orb and select **Open Debug Mode**. In the configuration panel, set:
 
 - **Agent name** — included in the system context
-- **System instructions** — response style and behavior
+- **System prompt** — the complete LLM system message; `{{agent_name}}` expands to the configured agent name
 - **API endpoint** — the OpenAI-compatible base URL
 - **Model** — model identifier accepted by the endpoint
 - **API key** — optional for local endpoints; stored in Keychain

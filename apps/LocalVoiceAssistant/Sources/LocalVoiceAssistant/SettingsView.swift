@@ -99,14 +99,14 @@ private struct LLMSettingsForm: View {
                     LabeledContent("Agent name") {
                         TextField("Nova", text: $settings.agentName).frame(width: 320)
                     }
-                    LabeledContent("Behavior") {
+                    LabeledContent("System prompt") {
                         TextEditor(text: $settings.systemPrompt)
                             .font(.body)
-                            .frame(width: 420, height: 90)
+                            .frame(width: 500, height: 180)
                             .padding(6)
                             .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
                     }
-                    Text("The name and behavior are injected into the context for every conversation.")
+                    Text("This is the complete system message sent to the LLM. Use {{agent_name}} wherever the configured agent name should appear.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -143,6 +143,6 @@ private struct LLMSettingsForm: View {
             .padding(12)
             .background(Color.cyan.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
         }
-        .frame(maxWidth: 650, alignment: .leading)
+        .frame(maxWidth: 720, alignment: .leading)
     }
 }
