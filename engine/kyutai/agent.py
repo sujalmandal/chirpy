@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -93,13 +94,16 @@ def debug(message: str) -> None:
 
 
 def load_config() -> dict[str, str]:
-    values = dict(os.environ)
+    values: dict[str, str] = {}
     if CONFIG.exists():
         for raw in CONFIG.read_text().splitlines():
             line = raw.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 values[key.strip()] = value.strip()
+    # Explicit process environment always wins. The macOS app supplies its
+    # persisted UI settings here, while local.env remains a CLI-friendly fallback.
+    values.update(os.environ)
     return values
 
 
@@ -108,7 +112,10 @@ def load_config() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def complete_url(base_url: str) -> str:
-    return base_url.rstrip("/") + "/chat/completions"
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    return normalized + "/chat/completions"
 
 
 def stream_chat(text: str, session_id: str, config: dict[str, str]):
@@ -179,6 +186,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             "stt_ready": _READY["stt_ready"],
             "tts_ready": _READY["tts_ready"],
             "llm_configured": bool(cfg.get("LLM_BASE_URL") and cfg.get("LLM_MODEL_NAME")),
+            "agent_name": cfg.get("AGENT_NAME", "Nova"),
+            "vad_model": cfg.get("VAD_REPO", cfg.get("STT_REPO", "")),
+            "stt_model": cfg.get("STT_REPO", ""),
+            "tts_model": cfg.get("TTS_REPO", ""),
         }
         body = json.dumps(payload).encode()
         self.send_response(200)
@@ -362,8 +373,8 @@ class Agent:
     def __init__(self, config: dict[str, str], websocket):
         self.config = config
         self.ws = websocket
-        self.session_id = "default"
-        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.session_id = str(uuid.uuid4())
+        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
         self.tts_queue: asyncio.Queue = asyncio.Queue()
         self.current_turn: asyncio.Task | None = None
         self.epoch = 0
@@ -385,6 +396,10 @@ class Agent:
         self.turn_audio_seconds = 0.0
         self.session_audio_seconds = 0.0
         self.session_text_chars = 0
+        self.energy_threshold = max(0.0001, float(config.get("VAD_THRESHOLD", "0.01")))
+        self.min_speech_blocks = max(1, round(float(config.get("VAD_MIN_SPEECH_MS", "320")) / 80))
+        self.min_silence_blocks = max(1, round(float(config.get("VAD_MIN_SILENCE_MS", "320")) / 80))
+        self.semantic_threshold = min(1.0, max(0.0, float(config.get("VAD_SEMANTIC_THRESHOLD", "0.6"))))
 
     async def send_event(self, **payload):
         await self.ws.send(json.dumps(payload))
@@ -453,6 +468,7 @@ class Agent:
         fragments: list[str] = []
         speech_run = 0
         silence_run = 0
+        semantic_pause_run = 0
         grace_until = 0.0
         while True:
             try:
@@ -528,24 +544,29 @@ class Agent:
                 debug(f"stt: idle rms={rms:.4f} speech_run={speech_run} silence_run={silence_run} fragments={len(fragments)}")
 
             try:
-                fragment, _vad = await self._mlx(stt.step, pcm)
+                fragment, vad_probability = await self._mlx(stt.step, pcm)
             except Exception as error:
                 log(f"STT step error: {error}")
                 await self._mlx(stt.reset)
                 fragments.clear()
                 speech_run = 0
                 silence_run = 0
+                semantic_pause_run = 0
                 continue
             if fragment:
                 fragments.append(fragment)
                 partial = "".join(fragments).strip()
                 await self.send_event(type="partial", text=partial)
             # Energy gate: track consecutive blocks above/below the speech level.
-            if rms >= 0.01:
+            if rms >= self.energy_threshold:
                 speech_run += 1
                 silence_run = 0
             else:
                 silence_run += 1
+            if speech_run >= self.min_speech_blocks and vad_probability >= self.semantic_threshold:
+                semantic_pause_run += 1
+            else:
+                semantic_pause_run = 0
             # The STT LmGen has a finite step window (~8192 blocks); it steps on
             # idle silence too, so reset it during long silences to avoid the
             # "narrow invalid args" overflow that would otherwise stall listening
@@ -554,11 +575,14 @@ class Agent:
                 await self._mlx(stt.reset)
                 speech_run = 0
                 silence_run = 0
-            if speech_run >= 4 and silence_run >= 4:
+            semantic_end = semantic_pause_run >= 2 and silence_run >= 1
+            energy_end = speech_run >= self.min_speech_blocks and silence_run >= self.min_silence_blocks
+            if semantic_end or energy_end:
                 transcript = await self._finalize(stt, fragments)
                 fragments = []
                 speech_run = 0
                 silence_run = 0
+                semantic_pause_run = 0
                 while not self.mic_queue.empty():
                     self.mic_queue.get_nowait()
                 if not transcript:
@@ -627,6 +651,7 @@ class Agent:
         HISTORY.setdefault(self.session_id, []).extend(
             [{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}]
         )
+        HISTORY[self.session_id] = HISTORY[self.session_id][-12:]
         self.session_audio_seconds += self.turn_audio_seconds
         self.session_text_chars += len(reply)
         log(
@@ -676,6 +701,8 @@ class Agent:
         try:
             async for message in self.ws:
                 if isinstance(message, bytes):
+                    if self.mic_queue.full():
+                        self.mic_queue.get_nowait()
                     self.mic_queue.put_nowait(message)
                 else:
                     try:
@@ -698,6 +725,9 @@ class Agent:
         finally:
             stt_task.cancel()
             writer_task.cancel()
+            if self.current_turn and not self.current_turn.done():
+                self.current_turn.cancel()
+            HISTORY.pop(self.session_id, None)
 
 
 def main():
@@ -711,6 +741,10 @@ def main():
     log("Loading Kyutai models (first run downloads weights)…")
     if DEBUG:
         log("debug logging enabled")
+    vad_repo = config.get("VAD_REPO", config.get("STT_REPO", "")).strip()
+    stt_repo = config.get("STT_REPO", "kyutai/stt-1b-en_fr-candle").strip()
+    if vad_repo and vad_repo != stt_repo:
+        log(f"VAD model {vad_repo!r} selected; using the semantic VAD head bundled with {stt_repo!r} until a matching adapter is installed")
     Agent.stt = SpeechToText(config)
     _READY["stt_ready"] = True
     log("STT ready")

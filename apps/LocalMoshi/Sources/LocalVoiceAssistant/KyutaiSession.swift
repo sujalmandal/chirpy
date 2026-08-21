@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Foundation
 
 @MainActor
@@ -19,6 +19,9 @@ final class KyutaiSession: NSObject, ObservableObject {
     private var converter: AVAudioConverter?
     private var socket: URLSessionWebSocketTask?
     private let wsURL = URL(string: "ws://127.0.0.1:9000")!
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectAttempt = 0
+    private var tapInstalled = false
 
     private let pcmLock = NSLock()
     private var pcmBuffer = Data()
@@ -78,6 +81,7 @@ final class KyutaiSession: NSObject, ObservableObject {
                 }
                 Task { @MainActor in self.handleLevel(level) }
             }
+            tapInstalled = true
             audioEngine.prepare(); try audioEngine.start()
             player.play()
             isListening = true; status = "Listening — speak naturally"
@@ -95,9 +99,18 @@ final class KyutaiSession: NSObject, ObservableObject {
 
     func stop() {
         sendTask?.cancel(); sendTask = nil
+        reconnectTask?.cancel(); reconnectTask = nil
         disconnect()
-        audioEngine.inputNode.removeTap(onBus: 0); audioEngine.stop()
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        audioEngine.stop()
         player.stop()
+        pcmLock.withLock { pcmBuffer.removeAll(keepingCapacity: true) }
+        pendingBuffers = 0
+        reconnectAttempt = 0
+        micLevel = 0; speakerLevel = 0
         isListening = false; isSpeaking = false; status = "Conversation stopped"
     }
 
@@ -135,12 +148,12 @@ final class KyutaiSession: NSObject, ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 var chunk: Data?
-                self.pcmLock.lock()
-                if self.pcmBuffer.count >= blockSamples * 4 {
-                    chunk = self.pcmBuffer.prefix(blockSamples * 4)
-                    self.pcmBuffer.removeFirst(blockSamples * 4)
+                self.pcmLock.withLock {
+                    if self.pcmBuffer.count >= self.blockSamples * 4 {
+                        chunk = self.pcmBuffer.prefix(self.blockSamples * 4)
+                        self.pcmBuffer.removeFirst(self.blockSamples * 4)
+                    }
                 }
-                self.pcmLock.unlock()
                 if let chunk, let socket = self.socket {
                     try? await socket.send(.data(chunk))
                 } else {
@@ -152,9 +165,11 @@ final class KyutaiSession: NSObject, ObservableObject {
 
     // -- WebSocket ----------------------------------------------------------
     private func connect() {
+        guard isListening, socket == nil else { return }
         let task = URLSession.shared.webSocketTask(with: wsURL)
         socket = task
         task.resume()
+        status = reconnectAttempt == 0 ? "Connecting to local voice engine…" : "Reconnecting…"
         receive()
     }
 
@@ -168,12 +183,27 @@ final class KyutaiSession: NSObject, ObservableObject {
                 guard let self else { return }
                 switch result {
                 case .success(let message):
+                    self.reconnectAttempt = 0
+                    self.status = self.isSpeaking ? "Speaking…" : "Listening — speak naturally"
                     self.handle(message)
                     self.receive()
                 case .failure:
-                    if self.isListening { self.connect() }
+                    self.socket = nil
+                    self.scheduleReconnect()
                 }
             }
+        }
+    }
+
+    private func scheduleReconnect() {
+        guard isListening, reconnectTask == nil else { return }
+        reconnectAttempt += 1
+        let delay = min(pow(2.0, Double(reconnectAttempt - 1)) * 0.35, 5.0)
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            self.reconnectTask = nil
+            self.connect()
         }
     }
 
@@ -218,7 +248,7 @@ final class KyutaiSession: NSObject, ObservableObject {
         let frames = data.count / MemoryLayout<Float>.size
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: AVAudioFrameCount(frames)), let samples = buffer.floatChannelData else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
-        data.withUnsafeBytes { source in memcpy(samples[0], source.baseAddress!, data.count) }
+        _ = data.withUnsafeBytes { source in memcpy(samples[0], source.baseAddress!, data.count) }
         var power: Float = 0
         for i in 0..<frames { power += samples[0][i] * samples[0][i] }
         speakerLevel = sqrt(power / Float(frames))

@@ -4,13 +4,17 @@ import SwiftUI
 struct LocalMoshiApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var engine = KyutaiEngine()
+    @StateObject private var settings = AppSettings()
 
     var body: some Scene {
         WindowGroup("Local Moshi") {
             ContentView()
                 .environmentObject(engine)
-                .frame(minWidth: 920, minHeight: 660)
+                .environmentObject(settings)
+                .frame(minWidth: 980, minHeight: 720)
         }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1080, height: 780)
     }
 }
 

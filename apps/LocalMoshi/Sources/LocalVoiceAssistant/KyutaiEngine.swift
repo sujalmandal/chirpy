@@ -17,12 +17,24 @@ final class KyutaiEngine: ObservableObject {
     private var launched = false
     private var healthTask: Task<Void, Never>?
     private var logHandle: FileHandle?
+    private var configuration: [String: String] = [:]
     private let readyTimeoutSeconds: Double = 120
 
     init() { Self.shared = self }
 
-    func startIfNeeded() { guard !launched else { return }; launched = true; start() }
-    func restart() { stop(); launched = true; start() }
+    func startIfNeeded(configuration: [String: String]) {
+        guard !launched else { return }
+        self.configuration = configuration
+        launched = true
+        start()
+    }
+
+    func restart(configuration: [String: String]) {
+        self.configuration = configuration
+        stop()
+        launched = true
+        start()
+    }
 
     func start() {
         isStarting = true; isReady = false; sttReady = false; ttsReady = false
@@ -41,6 +53,7 @@ final class KyutaiEngine: ObservableObject {
         task.executableURL = venv
         task.arguments = [script.path]
         task.currentDirectoryURL = root
+        task.environment = ProcessInfo.processInfo.environment.merging(configuration) { _, configured in configured }
         let output = Pipe()
         task.standardOutput = output; task.standardError = output
         pipe = output
@@ -87,7 +100,7 @@ final class KyutaiEngine: ObservableObject {
         FileManager.default.createFile(atPath: file.path, contents: nil)
         logHandle?.closeFile()
         logHandle = try? FileHandle(forWritingTo: file)
-        try? logHandle?.seekToEnd()
+        _ = try? logHandle?.seekToEnd()
     }
 
     private func closeLog() {
@@ -115,12 +128,13 @@ final class KyutaiEngine: ObservableObject {
             let deadline = Date().addingTimeInterval(readyTimeoutSeconds)
             while !Task.isCancelled {
                 let healthy = await self.health()
-                if self.isReady != healthy.stt || self.isReady != healthy.tts {
-                    self.isReady = healthy.stt && healthy.tts
-                    self.sttReady = healthy.stt
-                    self.ttsReady = healthy.tts
-                    self.status = self.isReady ? "Local voice engine ready" : self.status
-                    if self.isReady { self.isStarting = false; return }
+                self.isReady = healthy.stt && healthy.tts
+                self.sttReady = healthy.stt
+                self.ttsReady = healthy.tts
+                if self.isReady {
+                    self.status = "Local voice engine ready"
+                    self.isStarting = false
+                    return
                 }
                 if Date() >= deadline {
                     self.isStarting = false

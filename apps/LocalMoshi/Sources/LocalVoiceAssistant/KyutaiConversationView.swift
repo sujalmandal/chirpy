@@ -3,6 +3,7 @@ import SwiftUI
 struct KyutaiConversationView: View {
     @ObservedObject var session: KyutaiSession
     @ObservedObject var engine: KyutaiEngine
+    var showsEngineDetails = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -30,13 +31,15 @@ struct KyutaiConversationView: View {
                 }
                 .frame(minHeight: 150, alignment: .topLeading)
             }
-            GroupBox("Current engine") {
-                VStack(alignment: .leading, spacing: 6) {
-                    row("VAD", "Kyutai STT 1B · semantic end-of-turn + barge-in")
-                    row("STT", "Kyutai STT 1B (MLX) · English + French")
-                    row("LLM", "Configured Ollama Cloud OpenAI-compatible endpoint")
-                    row("TTS", "Kyutai TTS 1.6B (MLX) · streaming")
-                }.frame(maxWidth: .infinity, alignment: .leading)
+            if showsEngineDetails {
+                GroupBox("Current engine") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        row("VAD", "Configurable local turn detection + barge-in")
+                        row("STT", "Hugging Face model through the MLX adapter")
+                        row("LLM", "OpenAI-compatible endpoint")
+                        row("TTS", "Hugging Face model through the MLX adapter")
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             GroupBox("Engine log") {
                 ScrollViewReader { proxy in
@@ -53,6 +56,8 @@ struct KyutaiConversationView: View {
                     }
                 }
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Engine log output")
         }.padding(20)
     }
 
