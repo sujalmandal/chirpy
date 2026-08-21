@@ -19,12 +19,55 @@ class EndpointDetectorTests(unittest.TestCase):
         self.assertEqual(detector.state, EndpointState.WAITING)
 
     def test_semantic_endpoint_requires_text_and_hold(self):
-        detector = self.detector()
-        detector.observe(rms=0.08, semantic_probability=0.1, has_recognized_text=True)
-        first = detector.observe(rms=0.001, semantic_probability=0.9, has_recognized_text=False)
-        second = detector.observe(rms=0.001, semantic_probability=0.9, has_recognized_text=False)
-        self.assertIsNone(first)
-        self.assertEqual(second.reason, "semantic_vad")
+        detector = self.detector(semantic_silence_ms=240, semantic_hold_blocks=3)
+        detector.observe(
+            rms=0.08, semantic_probability=0.1,
+            has_recognized_text=True, new_recognized_text=True,
+        )
+        self.assertIsNone(detector.observe(
+            rms=0.001, semantic_probability=0.9, has_recognized_text=True
+        ))
+        self.assertIsNone(detector.observe(
+            rms=0.001, semantic_probability=0.9, has_recognized_text=True
+        ))
+        decision = detector.observe(
+            rms=0.001, semantic_probability=0.9, has_recognized_text=True
+        )
+        self.assertEqual(decision.reason, "semantic_vad")
+
+    def test_short_mid_sentence_pause_does_not_end_turn(self):
+        detector = self.detector(
+            min_silence_ms=800, semantic_silence_ms=320, semantic_hold_blocks=3
+        )
+        detector.observe(
+            rms=0.08, semantic_probability=0.1,
+            has_recognized_text=True, new_recognized_text=True,
+        )
+        for _ in range(3):
+            decision = detector.observe(
+                rms=0.001, semantic_probability=0.95, has_recognized_text=True
+            )
+        self.assertIsNone(decision)
+        detector.observe(
+            rms=0.08, semantic_probability=0.95, has_recognized_text=True
+        )
+        self.assertEqual(detector.pause_run, 0)
+
+    def test_new_token_cancels_pending_semantic_endpoint(self):
+        detector = self.detector(semantic_silence_ms=320, semantic_hold_blocks=3)
+        detector.observe(
+            rms=0.08, semantic_probability=0.1,
+            has_recognized_text=True, new_recognized_text=True,
+        )
+        for _ in range(2):
+            detector.observe(
+                rms=0.001, semantic_probability=0.95, has_recognized_text=True
+            )
+        detector.observe(
+            rms=0.001, semantic_probability=0.95,
+            has_recognized_text=True, new_recognized_text=True,
+        )
+        self.assertEqual(detector.pause_run, 0)
 
     def test_warmup_suppresses_unstable_semantic_frames(self):
         detector = self.detector(warmup_blocks=3)
@@ -68,6 +111,15 @@ class EndpointDetectorTests(unittest.TestCase):
         for _ in range(200):
             detector.observe(rms=0.02, semantic_probability=0.1, has_recognized_text=False)
         self.assertGreater(detector.energy_threshold, 0.04)
+
+    def test_delayed_first_token_does_not_train_noise_floor_on_speech(self):
+        detector = self.detector(base_energy_threshold=0.01)
+        for _ in range(25):
+            detector.observe(rms=0.002, semantic_probability=0.1, has_recognized_text=False)
+        baseline = detector.energy_threshold
+        for _ in range(7):
+            detector.observe(rms=0.08, semantic_probability=0.1, has_recognized_text=False)
+        self.assertLess(detector.energy_threshold, baseline * 1.25)
 
 
 if __name__ == "__main__":

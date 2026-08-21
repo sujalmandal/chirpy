@@ -436,11 +436,12 @@ class Agent:
         self.endpoint = EndpointDetector(
             base_energy_threshold=float(config.get("VAD_THRESHOLD", "0.01")),
             min_speech_ms=int(config.get("VAD_MIN_SPEECH_MS", "320")),
-            min_silence_ms=int(config.get("VAD_MIN_SILENCE_MS", "320")),
+            min_silence_ms=int(config.get("VAD_MIN_SILENCE_MS", "800")),
+            semantic_silence_ms=int(config.get("VAD_SEMANTIC_SILENCE_MS", "320")),
             semantic_end_threshold=float(config.get("VAD_SEMANTIC_THRESHOLD", "0.6")),
             semantic_speech_threshold=float(config.get("VAD_SEMANTIC_SPEECH_THRESHOLD", "0.4")),
             warmup_blocks=int(config.get("VAD_WARMUP_BLOCKS", "12")),
-            semantic_hold_blocks=int(config.get("VAD_SEMANTIC_HOLD_BLOCKS", "2")),
+            semantic_hold_blocks=int(config.get("VAD_SEMANTIC_HOLD_BLOCKS", "3")),
             noise_multiplier=float(config.get("VAD_NOISE_MULTIPLIER", "3.0")),
         )
         self.stt_error_streak = 0
@@ -668,6 +669,7 @@ class Agent:
                 rms=rms,
                 semantic_probability=vad_probability,
                 has_recognized_text=has_text,
+                new_recognized_text=bool(fragment and has_text),
             )
             if self.endpoint.state != self.last_vad_state:
                 debug(
@@ -700,7 +702,8 @@ class Agent:
                         f"silence_ms={decision.silence_ms} "
                         f"vad_raw={decision.semantic_probability:.3f} "
                         f"vad_smooth={decision.smoothed_probability:.3f} "
-                        f"energy_threshold={decision.energy_threshold:.4f}"
+                        f"energy_threshold={decision.energy_threshold:.4f} "
+                        f"token_age_ms={decision.token_age_ms}"
                     )
                     continue
                 # If a turn is still running (e.g. LLM still streaming), cancel
@@ -715,7 +718,8 @@ class Agent:
                     f"speech_ms={decision.speech_ms} silence_ms={decision.silence_ms} "
                     f"vad_raw={decision.semantic_probability:.3f} "
                     f"vad_smooth={decision.smoothed_probability:.3f} "
-                    f"energy_threshold={decision.energy_threshold:.4f} transcript={transcript!r}"
+                    f"energy_threshold={decision.energy_threshold:.4f} "
+                    f"token_age_ms={decision.token_age_ms} transcript={transcript!r}"
                 )
                 self.current_turn = asyncio.create_task(
                     self.run_turn(transcript, turn_id, decision.reason)

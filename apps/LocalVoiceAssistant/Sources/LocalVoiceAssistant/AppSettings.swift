@@ -41,7 +41,7 @@ final class AppSettings: ObservableObject {
         static let vadRepo = "kyutai/stt-1b-en_fr-candle"
         static let vadThreshold = 0.01
         static let minSpeechMS = 320
-        static let minSilenceMS = 320
+        static let minSilenceMS = 800
         static let sttRepo = "kyutai/stt-1b-en_fr-candle"
         static let ttsRepo = "kyutai/tts-1.6b-en_fr"
         static let ttsVoiceRepo = "kyutai/tts-voices"

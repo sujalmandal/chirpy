@@ -25,6 +25,7 @@ class EndpointDecision:
     semantic_probability: float
     smoothed_probability: float
     energy_threshold: float
+    token_age_ms: int | None
 
 
 class EndpointDetector:
@@ -37,11 +38,12 @@ class EndpointDetector:
         *,
         base_energy_threshold: float = 0.01,
         min_speech_ms: int = 320,
-        min_silence_ms: int = 320,
+        min_silence_ms: int = 800,
+        semantic_silence_ms: int = 320,
         semantic_end_threshold: float = 0.6,
         semantic_speech_threshold: float = 0.4,
         warmup_blocks: int = 12,
-        semantic_hold_blocks: int = 2,
+        semantic_hold_blocks: int = 3,
         noise_multiplier: float = 3.0,
         noise_alpha: float = 0.04,
         semantic_time_constant: float = 0.01,
@@ -49,6 +51,7 @@ class EndpointDetector:
         self.base_energy_threshold = max(0.0001, base_energy_threshold)
         self.min_speech_blocks = max(1, round(min_speech_ms / self.block_ms))
         self.min_silence_blocks = max(1, round(min_silence_ms / self.block_ms))
+        self.semantic_silence_blocks = max(1, round(semantic_silence_ms / self.block_ms))
         self.semantic_end_threshold = min(1.0, max(0.0, semantic_end_threshold))
         self.semantic_speech_threshold = min(
             self.semantic_end_threshold, max(0.0, semantic_speech_threshold)
@@ -73,6 +76,8 @@ class EndpointDetector:
         self.energy_run = 0
         self.candidate_speech_peak = 0
         self.candidate_silence_run = 0
+        self.idle_rms_window: list[float] = []
+        self.last_text_block: int | None = None
 
     @property
     def energy_threshold(self) -> float:
@@ -83,7 +88,12 @@ class EndpointDetector:
         return self.state == EndpointState.SPEAKING
 
     def observe(
-        self, *, rms: float, semantic_probability: float, has_recognized_text: bool
+        self,
+        *,
+        rms: float,
+        semantic_probability: float,
+        has_recognized_text: bool,
+        new_recognized_text: bool = False,
     ) -> EndpointDecision | None:
         rms = max(0.0, rms)
         semantic_probability = min(1.0, max(0.0, semantic_probability))
@@ -93,10 +103,16 @@ class EndpointDetector:
         )
 
         if not self.armed:
-            # Follow a sustained room-noise increase without letting a single
-            # click or the first syllable of speech poison the estimate.
-            capped_rms = min(rms, max(self.base_energy_threshold, self.noise_floor * 1.5))
-            self.noise_floor += self.noise_alpha * (capped_rms - self.noise_floor)
+            # Estimate ambient sound from a two-second window's quiet quintile.
+            # Speech is much louder than the lower samples and therefore cannot
+            # ratchet the threshold upward during Kyutai's delayed first token.
+            self.idle_rms_window.append(rms)
+            if len(self.idle_rms_window) > 25:
+                self.idle_rms_window.pop(0)
+            if len(self.idle_rms_window) == 25:
+                ordered = sorted(self.idle_rms_window)
+                ambient = ordered[len(ordered) // 5]
+                self.noise_floor += self.noise_alpha * (ambient - self.noise_floor)
 
         if self.blocks_seen <= self.warmup_blocks:
             self.state = EndpointState.WARMING_UP
@@ -128,12 +144,18 @@ class EndpointDetector:
                 self.speech_blocks = self.candidate_speech_peak
                 self.silence_run = self.candidate_silence_run
                 just_armed = True
+            if new_recognized_text:
+                self.last_text_block = self.blocks_seen
+                self.pause_run = 0
+                self.smoothed_probability = 0.0
 
         if self.armed and not just_armed:
             if above_energy:
                 self.energy_run += 1
                 self.silence_run = 0
                 self.speech_blocks += 1
+                # Never carry a pending pause decision through live speech.
+                self.pause_run = 0
             else:
                 # This reset fixes the old cumulative-noise-burst behavior.
                 self.energy_run = 0
@@ -143,12 +165,17 @@ class EndpointDetector:
             self.pause_run = 0
             return None
 
-        if self.smoothed_probability >= self.semantic_end_threshold:
+        if above_energy:
+            self.pause_run = 0
+        elif self.smoothed_probability >= self.semantic_end_threshold:
             self.pause_run += 1
         elif self.smoothed_probability <= self.semantic_speech_threshold:
             self.pause_run = 0
 
-        semantic_end = self.pause_run >= self.semantic_hold_blocks and self.silence_run >= 1
+        semantic_end = (
+            self.pause_run >= self.semantic_hold_blocks
+            and self.silence_run >= self.semantic_silence_blocks
+        )
         energy_end = (
             self.speech_blocks >= self.min_speech_blocks
             and self.silence_run >= self.min_silence_blocks
@@ -163,4 +190,9 @@ class EndpointDetector:
             semantic_probability=semantic_probability,
             smoothed_probability=self.smoothed_probability,
             energy_threshold=self.energy_threshold,
+            token_age_ms=(
+                None
+                if self.last_text_block is None
+                else (self.blocks_seen - self.last_text_block) * self.block_ms
+            ),
         )
