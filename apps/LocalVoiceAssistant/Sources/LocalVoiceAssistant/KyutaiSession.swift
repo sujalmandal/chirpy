@@ -51,6 +51,7 @@ final class KyutaiSession: NSObject, ObservableObject {
     private let pcmLock = NSLock()
     private var pcmBuffer = Data()
     private var inputFrameSeen = false
+    private var inputPeak: Float = 0
     private var sendTask: Task<Void, Never>?
     private var pendingBuffers = 0
     private var turnDone = false
@@ -84,7 +85,7 @@ final class KyutaiSession: NSObject, ObservableObject {
         status = "Microphone permission denied — allow it in System Settings > Privacy & Security > Microphone, then restart."
     }
 
-    private func beginListening(enableVoiceProcessing: Bool = true) {
+    private func beginListening(enableVoiceProcessing: Bool = false) {
         let input = audioEngine.inputNode
         do {
             // Voice processing gives the endpoint detector an echo-cancelled
@@ -105,7 +106,10 @@ final class KyutaiSession: NSObject, ObservableObject {
             }
             let format = input.inputFormat(forBus: 0)
             converter = AVAudioConverter(from: format, to: recordingFormat)
-            pcmLock.withLock { inputFrameSeen = false }
+            pcmLock.withLock {
+                inputFrameSeen = false
+                inputPeak = 0
+            }
             input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 100), format: format) { [weak self] buffer, _ in
                 guard let self else { return }
                 var level: Float = 0
@@ -118,6 +122,7 @@ final class KyutaiSession: NSObject, ObservableObject {
                 if let data = self.convert(buffer) {
                     self.pcmLock.lock()
                     self.inputFrameSeen = true
+                    self.inputPeak = max(self.inputPeak, level)
                     self.pcmBuffer.append(data)
                     self.pcmLock.unlock()
                 }
@@ -164,8 +169,11 @@ final class KyutaiSession: NSObject, ObservableObject {
         voiceProcessingWatchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))
             guard let self, !Task.isCancelled else { return }
-            let receivedInput = self.pcmLock.withLock { self.inputFrameSeen }
-            guard !receivedInput else { return }
+            let inputHealth = self.pcmLock.withLock { (self.inputFrameSeen, self.inputPeak) }
+            // Some macOS/device combinations deliver voice-processing buffers
+            // containing near-zero samples. Treat that as a failed capture
+            // path even though the audio tap itself is firing.
+            guard !inputHealth.0 || inputHealth.1 < 0.0001 else { return }
             self.restartWithoutVoiceProcessing()
         }
     }

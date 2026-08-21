@@ -18,7 +18,7 @@ The primary interface is a borderless floating orb designed for continuous conve
 
 ```mermaid
 flowchart LR
-    microphone[Microphone] -->|native echo-cancelled audio| app
+    microphone[Microphone] -->|native audio capture| app
 
     subgraph mac[Your Mac]
         app[Native SwiftUI application]
@@ -41,7 +41,7 @@ flowchart LR
     app -.->|configuration and debug events| engine
 ```
 
-The macOS app manages the interface, echo-cancelled microphone capture, audio playback, settings, and debug workspace. The local engine keeps the MLX speech models warm and fuses recognized speech, semantic pause prediction, and an adaptive room-noise floor to detect the end of a user turn. It then streams text to the configured LLM and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
+The macOS app manages the interface, native microphone capture, audio playback, settings, and debug workspace. The local engine keeps the MLX speech models warm and fuses recognized speech, semantic pause prediction, and an adaptive room-noise floor to detect the end of a user turn. It then streams text to the configured LLM and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
 
 The app and engine exchange JSON state/text events and binary audio frames over a local WebSocket. Engine readiness is exposed through a local HTTP health endpoint.
 
