@@ -16,9 +16,9 @@ import logging
 import os
 from pathlib import Path
 
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, room_io
 from livekit.agents.inference import TurnDetector
-from livekit.plugins import openai, silero
+from livekit.plugins import dtln, openai, silero
 
 from plugins import KokoroTTS, WhisperSTT
 
@@ -78,6 +78,12 @@ async def entrypoint(ctx: JobContext):
             # audio back up, causing the agent to interrupt its own speech.
             "interruption": {"enabled": False},
         },
+        # DTLN noise suppression on the inbound mic audio (self-hosted, in-process).
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=dtln.noise_suppression(),
+            ),
+        ),
     )
 
     agent = Agent(instructions=system_prompt)
