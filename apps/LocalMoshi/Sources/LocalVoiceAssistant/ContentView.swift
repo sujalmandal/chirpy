@@ -29,19 +29,28 @@ private struct AssistantView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        ZStack {
-            Color(red: 0.075, green: 0.078, blue: 0.082).ignoresSafeArea()
-            VStack(spacing: 16) {
-                VoiceOrb(
-                    micLevel: session.micLevel,
-                    speakerLevel: session.speakerLevel,
-                    active: session.isListening || session.isSpeaking
-                )
-                .frame(width: 142, height: 142)
-                controls
+        VStack(spacing: 10) {
+            VoiceOrb(
+                micLevel: session.micLevel,
+                speakerLevel: session.speakerLevel,
+                active: session.isListening || session.isSpeaking
+            )
+            .frame(width: 124, height: 124)
+            controls
+            if !session.transcript.isEmpty {
+                Text(session.transcript)
+                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.94))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .frame(maxWidth: 250, minHeight: 36, alignment: .top)
+                    .shadow(color: .black.opacity(0.9), radius: 4, y: 1)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
-            .offset(y: -4)
         }
+        .animation(.easeOut(duration: 0.18), value: session.transcript)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.clear)
         .contentShape(Rectangle())
         .contextMenu {
             Button {
@@ -77,8 +86,8 @@ private struct AssistantView: View {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .medium))
                 .frame(width: 30, height: 30)
-                .background(Color.white.opacity(0.075), in: Circle())
-                .overlay(Circle().stroke(.white.opacity(0.16), lineWidth: 0.7))
+                .background(Color.black.opacity(0.46), in: Circle())
+                .overlay(Circle().stroke(.white.opacity(0.24), lineWidth: 0.7))
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white.opacity(0.92))

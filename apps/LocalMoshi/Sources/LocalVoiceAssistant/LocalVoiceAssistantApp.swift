@@ -15,11 +15,11 @@ struct LocalMoshiApp: App {
                 .environmentObject(settings)
                 .environmentObject(session)
                 .environmentObject(metrics)
-                .frame(width: 320, height: 360)
+                .frame(width: 280, height: 270)
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
-        .defaultSize(width: 320, height: 360)
+        .defaultSize(width: 280, height: 270)
 
         Window("Voice Assistant Debug", id: "debug") {
             DebugDashboardView(session: session, engine: engine, metrics: metrics)
@@ -36,9 +36,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             guard let window = NSApp.windows.first(where: { $0.title == "Local Voice Assistant" }) else { return }
-            window.standardWindowButton(.closeButton)?.isHidden = true
-            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-            window.standardWindowButton(.zoomButton)?.isHidden = true
+            window.styleMask = [.borderless]
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.hasShadow = false
             window.isMovableByWindowBackground = true
             window.level = .floating
             window.collectionBehavior.insert(.fullScreenAuxiliary)

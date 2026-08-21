@@ -4,9 +4,10 @@ Local Voice Assistant is a private, real-time voice assistant for Apple
 Silicon Macs. It pairs a native SwiftUI app with fully local, on-device speech
 models from Kyutai and an OpenAI-compatible cloud reasoning model.
 
-The app opens as a compact, floating voice control inspired by ChatGPT Voice
-for macOS. Right-click the window and choose **Open Debug Mode** to open the
-full dashboard, inspect metrics and logs, or configure each stage of the
+The app opens as a borderless, transparent floating voice control inspired by
+ChatGPT Voice for macOS. Only the orb, call controls, and live transcript are
+drawn. Right-click the floating control and choose **Open Debug Mode** to open
+the full dashboard, inspect metrics and logs, or configure each stage of the
 `VAD → STT → LLM → TTS` pipeline.
 
 ```text
