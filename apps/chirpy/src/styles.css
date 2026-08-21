@@ -108,11 +108,11 @@ button {
 }
 
 #transcript {
-  top: calc(44% + 70px);
+  top: calc(44% + 120px);
 }
 
 #reply {
-  top: calc(44% + 98px);
+  top: calc(44% + 148px);
 }
 
 .caption.visible {
@@ -137,7 +137,7 @@ button {
 
 .controls.under-orb {
   position: absolute;
-  bottom: 20px;
+  top: calc(44% + 80px);
   left: 50%;
   transform: translateX(-50%);
 }
