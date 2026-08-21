@@ -111,6 +111,7 @@ class VoiceSession {
   onSpeaking: (b: boolean) => void = () => {};
   onListening: (b: boolean) => void = () => {};
   onUserMessage: (text: string) => void = () => {};
+  onUserPartial: (text: string) => void = () => {};
   onAssistantStart: () => void = () => {};
   onAssistantDelta: (delta: string) => void = () => {};
   onAssistantEnd: () => void = () => {};
@@ -235,6 +236,7 @@ class VoiceSession {
       case "partial":
         this.transcript = (event.text as string) ?? "";
         this.onTranscript(this.transcript);
+        this.onUserPartial(this.transcript);
         break;
       case "user":
         this.transcript = (event.text as string) ?? "";
@@ -274,7 +276,9 @@ function now() {
 // Inline SVG glyphs (no emoji / image assets).
 const ICONS = {
   mic: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`,
+  micOff: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><path d="M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2"/><path d="M19 10v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`,
   speaker: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg>`,
+  speakerMuted: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`,
   debug: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
   quit: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
   gear: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
@@ -305,14 +309,33 @@ function renderOrb() {
   `;
   document.getElementById("mic")!.onclick = () => {
     session.isListening ? session.stop() : session.start();
+    updateOrbControls();
   };
-  document.getElementById("speaker")!.onclick = () => session.toggleOutputMuted();
+  document.getElementById("speaker")!.onclick = () => {
+    session.toggleOutputMuted();
+    updateOrbControls();
+  };
   document.getElementById("debug")!.onclick = () => invoke("open_debug");
   document.getElementById("quit")!.onclick = () => getCurrentWindow().close();
   document.getElementById("orb-shell")!.addEventListener("mousedown", (e) => {
     if ((e.target as HTMLElement).closest("button")) return;
     getCurrentWindow().startDragging();
   });
+  updateOrbControls();
+}
+
+// Reflect the live mic/speaker state in the under-orb buttons.
+function updateOrbControls() {
+  const mic = document.getElementById("mic");
+  const speaker = document.getElementById("speaker");
+  if (mic) {
+    mic.innerHTML = session.isListening ? ICONS.mic : ICONS.micOff;
+    mic.classList.toggle("off", !session.isListening);
+  }
+  if (speaker) {
+    speaker.innerHTML = session.isOutputMuted ? ICONS.speakerMuted : ICONS.speaker;
+    speaker.classList.toggle("off", session.isOutputMuted);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +457,30 @@ function finishLastAssistant() {
   }
 }
 
+// Update the in-progress user message as the user speaks (partial), or finalize
+// it once the transcript is committed. Creates the user bubble lazily.
+function updateLastUser(text: string, final: boolean) {
+  const box = document.getElementById("messages");
+  if (!box) return;
+  let last: HTMLElement | null | undefined = box.lastElementChild as HTMLElement | null;
+  let m = messages[messages.length - 1];
+  if (!last || !last.classList.contains("user") || m?.state !== "streaming") {
+    m = { role: "user", text: "", time: now(), state: "streaming" };
+    messages.push(m);
+    last = appendMessage(m);
+  }
+  if (!last) return;
+  const textEl = last.querySelector(".log-text");
+  if (textEl) textEl.textContent = text || (final ? "" : "▍");
+  m.text = text;
+  if (final) {
+    last.classList.remove("streaming");
+    last.classList.add("completed");
+    m.state = "completed";
+  }
+  tailScroll(box);
+}
+
 function escapeHtml(s: string) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
 }
@@ -547,8 +594,10 @@ async function init() {
     // The debug window observes the conversation via events broadcast by the
     // main window (which owns the voice session).
     listen("conversation-user", (e) => {
-      messages.push({ role: "user", text: e.payload as string, time: now(), state: "completed" });
-      appendMessage(messages[messages.length - 1]);
+      updateLastUser(e.payload as string, true);
+    });
+    listen("conversation-user-partial", (e) => {
+      updateLastUser(e.payload as string, false);
     });
     listen("conversation-assistant-delta", (e) => {
       // Create the assistant bubble lazily on the first delta.
@@ -583,9 +632,11 @@ async function init() {
     session.onListening = (b) => {
       const orb = document.getElementById("orb");
       if (orb) orb.classList.toggle("listening", b);
+      updateOrbControls();
     };
     // Broadcast the conversation to the debug window.
     session.onUserMessage = (text) => emit("conversation-user", text);
+    session.onUserPartial = (text) => emit("conversation-user-partial", text);
     session.onAssistantDelta = (delta) => emit("conversation-assistant-delta", delta);
     session.onAssistantEnd = () => emit("conversation-assistant-end", null);
     setInterval(pollStatus, 1000);
