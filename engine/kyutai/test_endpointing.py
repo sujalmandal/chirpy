@@ -5,6 +5,7 @@ from endpointing import (
     EndpointDetector,
     EndpointState,
     is_probable_playback_echo,
+    recognized_barge_in_ready,
 )
 
 
@@ -185,6 +186,21 @@ class PlaybackEchoTests(unittest.TestCase):
         self.assertFalse(is_probable_playback_echo(
             "stop it",
             "You can stop it from the menu.",
+        ))
+
+    def test_residual_energy_allows_short_command(self):
+        self.assertTrue(recognized_barge_in_ready(
+            "stop", residual_confirmed=True
+        ))
+
+    def test_multiword_speech_does_not_require_delayed_energy_overlap(self):
+        self.assertTrue(recognized_barge_in_ready(
+            "please stop talking", residual_confirmed=False
+        ))
+
+    def test_single_unconfirmed_token_is_not_enough(self):
+        self.assertFalse(recognized_barge_in_ready(
+            "yeah", residual_confirmed=False
         ))
 
 

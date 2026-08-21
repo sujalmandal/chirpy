@@ -42,7 +42,12 @@ from moshi_mlx.models.tts import TTSModel, DEFAULT_DSM_TTS_REPO, DEFAULT_DSM_TTS
 from moshi_mlx.utils import Sampler
 from moshi_mlx.utils.loaders import hf_get
 
-from endpointing import BargeInGate, EndpointDetector, is_probable_playback_echo
+from endpointing import (
+    BargeInGate,
+    EndpointDetector,
+    is_probable_playback_echo,
+    recognized_barge_in_ready,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "config" / "local.env"
@@ -570,6 +575,7 @@ class Agent:
         )
         self.barge_energy_confirmed_until = 0.0
         self.current_reply_text = ""
+        self.stt_discard_epoch = 0
         self.cancel_flag = False
         self.playback_started = 0.0
         self.last_k_update = 0.0
@@ -691,6 +697,7 @@ class Agent:
         stt = Agent.stt
         fragments: list[str] = []
         grace_until = 0.0
+        discard_epoch = self.stt_discard_epoch
         while True:
             if self.session_id != Agent.active_session_id:
                 return
@@ -698,6 +705,10 @@ class Agent:
                 pcm = await asyncio.wait_for(self.mic_queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
                 continue
+            if discard_epoch != self.stt_discard_epoch:
+                fragments.clear()
+                self.endpoint.reset()
+                discard_epoch = self.stt_discard_epoch
             rms = 0.0
             if pcm:
                 samples = np.frombuffer(pcm, dtype=np.float32)
@@ -829,23 +840,32 @@ class Agent:
                         await self._mlx(stt.reset)
                         self.endpoint.reset()
                         continue
-                    if time.time() <= self.barge_energy_confirmed_until:
+                    residual_confirmed = (
+                        time.time() <= self.barge_energy_confirmed_until
+                    )
+                    if recognized_barge_in_ready(
+                        partial, residual_confirmed=residual_confirmed
+                    ):
+                        log(
+                            f"turn={self.current_turn_id or '-'} owner=user "
+                            "state=barge_in_detected "
+                            f"evidence={'recognized_plus_residual' if residual_confirmed else 'recognized_non_echo'} "
+                            f"transcript={partial[:120]!r}"
+                        )
                         await self.send_event(type="partial", text=partial)
                         await self._cancel_current_turn(
                             "recognized_speech_barge_in", "user", reset_stt=False
                         )
                     else:
-                        log(
-                            f"turn={self.current_turn_id or '-'} owner=user "
-                            "state=suppressed reason=no_residual_energy "
-                            f"transcript={partial[:120]!r}"
-                        )
-                        fragments.clear()
-                        await self._mlx(stt.reset)
-                        self.endpoint.reset()
+                        debug(f"barge-in: awaiting more speech: {partial[:80]!r}")
                         continue
                 else:
                     await self.send_event(type="partial", text=partial)
+
+            # While playback is active, retain an unconfirmed transcript
+            # candidate for more words instead of endpointing it as a new turn.
+            if self.playback_active and fragments:
+                continue
 
             has_text = bool("".join(fragments).strip())
             decision = self.endpoint.observe(
@@ -1059,6 +1079,7 @@ class Agent:
                         self.cancel_flag = False
                         self.current_reply_text = ""
                         self.barge_energy_confirmed_until = 0.0
+                        self.stt_discard_epoch += 1
                         await self._mlx(Agent.stt.reset)
                         self.endpoint.reset()
         except websockets.ConnectionClosed:

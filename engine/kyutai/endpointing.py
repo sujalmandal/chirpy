@@ -248,3 +248,12 @@ def is_probable_playback_echo(transcript: str, assistant_reply: str) -> bool:
         if SequenceMatcher(None, candidate, window).ratio() >= 0.82:
             return True
     return False
+
+
+def recognized_barge_in_ready(transcript: str, *, residual_confirmed: bool) -> bool:
+    """Accept clear recognized speech without requiring delayed energy overlap."""
+    words = re.findall(r"[a-z0-9']+", transcript.lower())
+    character_count = len("".join(words))
+    if residual_confirmed:
+        return bool(words) and character_count >= 3
+    return len(words) >= 3 and character_count >= 10
