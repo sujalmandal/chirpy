@@ -78,6 +78,12 @@ async def entrypoint(ctx: JobContext):
             # audio back up, causing the agent to interrupt its own speech.
             "interruption": {"enabled": False},
         },
+    )
+
+    agent = Agent(instructions=system_prompt)
+    await session.start(
+        agent=agent,
+        room=ctx.room,
         # DTLN noise suppression on the inbound mic audio (self-hosted, in-process).
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -85,9 +91,6 @@ async def entrypoint(ctx: JobContext):
             ),
         ),
     )
-
-    agent = Agent(instructions=system_prompt)
-    await session.start(agent=agent, room=ctx.room)
     await session.generate_reply(instructions="Greet the user briefly.")
 
 

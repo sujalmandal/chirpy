@@ -147,8 +147,23 @@ class VoiceSession {
       await room.localParticipant.setMicrophoneEnabled(true);
       this.audioCtx = new AudioContext({ latencyHint: "interactive" });
       await this.audioCtx.resume();
-      // Ensure the agent worker is dispatched into this room.
-      await invoke("create_dispatch", { room: ROOM_NAME }).catch(() => {});
+      // Ensure the agent worker is dispatched into this room. The worker may
+      // still be starting up, so retry until the agent actually joins the room
+      // (the dispatch API can return 200 before the worker is ready). After each
+      // dispatch, wait for the agent to join before creating another, so we
+      // don't spawn duplicate agents.
+      for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+          await invoke("create_dispatch", { room: ROOM_NAME });
+        } catch {
+          /* ignore and retry */
+        }
+        for (let i = 0; i < 5; i++) {
+          if (this.agentInRoom(room)) break;
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        if (this.agentInRoom(room)) break;
+      }
       this.onStatus("Listening — speak naturally");
     } catch (e) {
       this.onStatus(`Could not connect: ${(e as Error).message}`);
@@ -186,6 +201,13 @@ class VoiceSession {
         p.audioTrackPublications.forEach((pub) => pub.setSubscribed(!this.outputMuted));
       });
     }
+  }
+
+  private agentInRoom(room: Room): boolean {
+    for (const p of room.remoteParticipants.values()) {
+      if (p.identity.startsWith("agent-")) return true;
+    }
+    return false;
   }
 
   private attachPlayback(track: Track) {
