@@ -1,7 +1,7 @@
-moshi-mlx==0.3.0
-mlx
-rustymimi==0.4.1
-sentencepiece
+faster-whisper
+kokoro
 numpy
 onnxruntime==1.29.0
-websockets
+livekit-agents
+livekit-plugins-silero
+livekit-plugins-openai

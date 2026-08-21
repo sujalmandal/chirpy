@@ -1,66 +1,62 @@
-# Local Voice Assistant
+# Chirpy
 
-Local Voice Assistant is a local-first, real-time voice interface for Apple Silicon Macs. It combines a focused native macOS experience with on-device speech processing and an OpenAI-compatible reasoning endpoint of your choice.
+Chirpy is a local-first, real-time voice assistant for Apple Silicon Macs. It combines a focused native desktop experience with on-device speech processing and an OpenAI-compatible reasoning endpoint of your choice.
 
 The primary interface is a borderless floating orb designed for continuous conversation. A dedicated Debug Mode provides the conversation timeline, operational telemetry, and runtime configuration needed to inspect and tune the voice pipeline.
 
 ## Highlights
 
-- Local speech recognition, adaptive semantic turn detection, and speech synthesis on Apple Silicon
+- Local speech recognition and speech synthesis on-device (faster-whisper STT + Kokoro TTS)
 - Streaming conversation with interruption support: speak while the assistant is responding to take the floor
-- Echo-cancelled WebRTC capture and playback embedded invisibly inside the native macOS interface
+- Media routing and echo-cancelled capture handled by a self-hosted LiveKit server
 - Floating, borderless voice interface with distinct connecting, listening, idle, and speaking states
 - Live transcript and reply captions that clear automatically
 - Configurable assistant identity, behavior, endpoint, model, and credentials
 - Timestamped conversation history and turn-level diagnostic logs
-- Credentials stored in the macOS Keychain
+- Credentials stored in the OS keychain
 
-## Data flow and architecture
+## Architecture
+
+Chirpy is split into a multiplatform desktop client and a local Python agent worker, connected through a self-hosted LiveKit server.
 
 ```mermaid
 flowchart LR
-    microphone[Microphone] -->|WebRTC echo-cancelled audio| app
+    client[Chirpy Client<br/>Tauri 2 · macOS/Windows/Linux]
+    lk[LiveKit Server<br/>livekit-server --dev]
+    worker[Chirpy Agent Worker<br/>Python · livekit-agents]
 
-    subgraph mac[Your Mac]
-        app[Native SwiftUI application]
-        engine[Local Python voice engine]
-        vad[Continuous Silero acoustic VAD<br/>ONNX CPU]
-        stt[Gated Kyutai STT and semantic endpointing<br/>MLX GPU]
-        tts[Kyutai streaming TTS<br/>MLX GPU]
-        output[Audio playback]
+    client -->|WebRTC mic audio| lk
+    lk -->|WebRTC agent audio| client
+    lk <-->|room media + data| worker
 
-        app -->|binary WebSocket audio| engine
-        engine -->|every microphone block| vad
-        vad -->|speech plus buffered pre-roll| stt
-        stt -->|completed transcript| engine
-        engine --> tts
-        tts -->|cancellable PCM audio| engine
-        engine -->|binary WebSocket audio| app
-        app --> output
+    subgraph worker[Agent Worker]
+        stt[faster-whisper STT<br/>local]
+        tts[Kokoro TTS<br/>local]
+        vad[Silero VAD]
+        llm[OpenAI-compatible LLM]
     end
 
-    engine -->|text conversation over HTTPS| llm[OpenAI-compatible LLM endpoint]
-    llm -->|streaming reply text| engine
-    app -.->|configuration and debug events| engine
+    worker -->|text conversation over HTTPS| llm
 ```
 
-The macOS app manages the native interface, settings, and debug workspace. A visually hidden local WebKit surface keeps microphone capture and assistant playback in one WebRTC/WebAudio graph so acoustic echo cancellation has the correct playback reference. Silero VAD evaluates every microphone block on CPU and keeps a short pre-roll buffer. When speech begins, the engine stops active playback and passes the complete buffered utterance to Kyutai STT on the GPU. Kyutai's semantic head then distinguishes a completed thought from a short pause. This keeps the latency-critical interruption path independent from the much larger transcription model without discarding spoken audio.
-
-The app and engine exchange JSON state/text events and binary audio frames over a local WebSocket. Engine readiness is exposed through a local HTTP health endpoint.
+- **Client** — a Tauri 2 app (Rust + webview) that connects to the LiveKit room, publishes the echo-cancelled microphone, and plays the agent's audio. The Rust backend spawns `livekit-server --dev` and the agent worker, and issues room tokens.
+- **LiveKit server** — the self-hosted SFU that routes media between the client and the agent worker.
+- **Agent worker** — a Python `livekit-agents` process that runs the voice pipeline: Silero VAD, faster-whisper STT, an OpenAI-compatible LLM, and Kokoro TTS. Turn detection and barge-in are LiveKit-native.
 
 ## Requirements
 
 - Apple Silicon Mac
 - macOS 14 or later
 - Homebrew Python 3.12 at `/opt/homebrew/bin/python3.12`
+- Homebrew (for `livekit-server`)
 - An OpenAI-compatible chat-completions endpoint, such as LM Studio or a hosted provider
 - Internet access for the initial speech-model download
 
-The initial setup downloads approximately 6.4 GB of model weights. They are subsequently loaded from the local Hugging Face cache.
+The initial setup downloads the small local speech models (faster-whisper `base` ~145 MB and Kokoro ~80 MB). They are subsequently loaded from the local Hugging Face cache.
 
 ## Quick start
 
-Install the local engine, its dependencies, and validate the speech stack:
+Install the local engine, its dependencies, the LiveKit server, and validate the speech stack:
 
 ```bash
 scripts/setup-kyutai.sh
@@ -69,8 +65,8 @@ scripts/setup-kyutai.sh
 Build and launch the native application:
 
 ```bash
-scripts/build-local-voice-assistant-app.sh
-open "Local Voice Assistant.app"
+scripts/build-chirpy-app.sh
+open "Chirpy.app"
 ```
 
 macOS requests microphone access on first launch. A changed bundle identifier or signing identity is treated as a new application by macOS and can require permission again.
@@ -83,7 +79,7 @@ Right-click the floating orb and select **Open Debug Mode**. In the configuratio
 - **System prompt** — the complete persistent LLM system message; `{{agent_name}}` expands to the configured agent name, and **Reset to Default** restores the built-in prompt
 - **API endpoint** — the OpenAI-compatible base URL
 - **Model** — model identifier accepted by the endpoint
-- **API key** — optional for local endpoints; stored in Keychain
+- **API key** — optional for local endpoints; stored in the OS keychain
 
 Select **Save & Restart** to apply changes. For a local LM Studio server, use an endpoint such as `http://localhost:1234/v1`.
 
@@ -94,16 +90,14 @@ For unattended or repeatable setup, copy `config/local.env.example` to `config/l
 Debug Mode is the operational view for the assistant. It includes:
 
 - A unified user/assistant transcript with timestamps and turn IDs
-- Engine status and local system metrics
-- Continuous CPU VAD health and latency, gated GPU STT timing, endpoint decisions, semantic pause scores, turn ownership, and cancellation sources
+- Backend status and local system metrics
+- LiveKit server and agent worker logs
 - LLM and agent configuration
 
 Log files are written to:
 
-- `logs/kyutai-agent.log` — engine startup, voice turns, and cancellation lifecycle
-- `logs/local-voice-assistant.log` — native application process output
-
-For local integration diagnostics, the engine health endpoint is `http://127.0.0.1:8999/health` and its WebSocket service is `ws://127.0.0.1:9000`.
+- `logs/livekit-server.log` — the self-hosted LiveKit server
+- `logs/chirpy-agent.log` — the agent worker (voice turns, model loading, errors)
 
 ## Privacy
 
@@ -112,13 +106,14 @@ Audio capture, VAD, transcription, and speech synthesis stay on the Mac. The con
 ## Repository layout
 
 ```text
-apps/LocalVoiceAssistant/   Native SwiftUI macOS application
-engine/kyutai/              Local STT, VAD, LLM, and TTS engine
-config/                     Example local configuration
-scripts/                    Setup and application build scripts
+apps/chirpy/             Tauri 2 multiplatform desktop client
+engine/kyutai/           Local STT/TTS models + LiveKit agent worker
+  plugins/               faster-whisper STT + Kokoro TTS LiveKit Agents plugins
+config/                  Example local configuration
+scripts/                 Setup and application build scripts
 ```
 
-The Kyutai MLX runtime is an internal speech-engine dependency; it is not part of the application or bundle naming.
+The speech models are small, on-device dependencies; they are not part of the application or bundle naming.
 
 ## License
 
