@@ -105,7 +105,10 @@ class VoiceSession {
   onReply: (t: string) => void = () => {};
   onSpeaking: (b: boolean) => void = () => {};
   onListening: (b: boolean) => void = () => {};
-  onMessage: (m: ChatMessage) => void = () => {};
+  onUserMessage: (text: string) => void = () => {};
+  onAssistantStart: () => void = () => {};
+  onAssistantDelta: (delta: string) => void = () => {};
+  onAssistantEnd: () => void = () => {};
 
   get isListening() {
     return this.listening;
@@ -186,13 +189,6 @@ class VoiceSession {
     this.onStatus("Conversation stopped");
   }
 
-  interrupt() {
-    if (!this.speaking) return;
-    this.speaking = false;
-    this.onSpeaking(false);
-    this.onStatus("Listening…");
-  }
-
   toggleOutputMuted() {
     this.outputMuted = !this.outputMuted;
     this.playbackEls.forEach((el) => (el.muted = this.outputMuted));
@@ -235,7 +231,7 @@ class VoiceSession {
         this.transcript = (event.text as string) ?? "";
         this.reply = "";
         this.onTranscript(this.transcript);
-        this.onMessage({ role: "user", text: this.transcript, state: "completed" });
+        this.onUserMessage(this.transcript);
         break;
       case "partial":
         this.transcript = (event.text as string) ?? "";
@@ -244,19 +240,23 @@ class VoiceSession {
       case "turn_started":
         this.speaking = true;
         this.onSpeaking(true);
-        this.onMessage({ role: "assistant", text: "", state: "streaming" });
+        this.reply = "";
+        this.onAssistantStart();
         break;
       case "text":
         this.reply += (event.delta as string) ?? "";
         this.onReply(this.reply);
+        this.onAssistantDelta((event.delta as string) ?? "");
         break;
       case "done":
         this.speaking = false;
         this.onSpeaking(false);
+        this.onAssistantEnd();
         break;
       case "interrupted":
         this.speaking = false;
         this.onSpeaking(false);
+        this.onAssistantEnd();
         break;
       case "error":
         this.onStatus((event.message as string) ?? "Chirpy error");
@@ -265,20 +265,32 @@ class VoiceSession {
   }
 }
 
-interface ChatMessage {
-  role: "user" | "assistant";
-  text: string;
-  state: "streaming" | "completed" | "cancelled" | "failed";
-}
-
 const session = new VoiceSession();
 
 // ---------------------------------------------------------------------------
-// UI wiring
+// UI helpers
 // ---------------------------------------------------------------------------
 
 const root = document.getElementById("root")!;
 const isDebug = new URLSearchParams(window.location.search).get("window") === "debug";
+
+function now() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// Inline SVG glyphs (no emoji / image assets).
+const ICONS = {
+  mic: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`,
+  speaker: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg>`,
+  debug: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
+  quit: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+  gear: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
+  restart: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`,
+};
+
+// ---------------------------------------------------------------------------
+// Orb window
+// ---------------------------------------------------------------------------
 
 function renderOrb() {
   root.innerHTML = `
@@ -287,53 +299,90 @@ function renderOrb() {
       <div class="caption" id="transcript"></div>
       <div class="caption reply" id="reply"></div>
       <div class="controls">
-        <button id="mic" title="Mute microphone">🎤</button>
-        <button id="quit" title="Quit Chirpy">✕</button>
-        <button id="speaker" title="Mute speaker">🔊</button>
+        <button id="mic" title="Toggle microphone">${ICONS.mic}</button>
+        <button id="speaker" title="Mute speaker">${ICONS.speaker}</button>
+        <button id="debug" title="Open debug mode">${ICONS.debug}</button>
+        <button id="quit" title="Quit Chirpy">${ICONS.quit}</button>
       </div>
     </div>
   `;
   document.getElementById("mic")!.onclick = () => {
     session.isListening ? session.stop() : session.start();
   };
-  document.getElementById("quit")!.onclick = () => getCurrentWindow().close();
   document.getElementById("speaker")!.onclick = () => session.toggleOutputMuted();
+  document.getElementById("debug")!.onclick = () => invoke("open_debug");
+  document.getElementById("quit")!.onclick = () => getCurrentWindow().close();
   document.getElementById("orb-shell")!.addEventListener("mousedown", (e) => {
     if ((e.target as HTMLElement).closest("button")) return;
     getCurrentWindow().startDragging();
   });
 }
 
+// ---------------------------------------------------------------------------
+// Debug window
+// ---------------------------------------------------------------------------
+
+interface ChatMessage {
+  role: "user" | "assistant";
+  text: string;
+  time: string;
+  state: "streaming" | "completed" | "cancelled";
+}
+
+const messages: ChatMessage[] = [];
+
 function renderDebug() {
   root.innerHTML = `
     <div class="debug">
       <header>
-        <span id="status">Getting ready</span>
+        <div class="brand">Chirpy <span class="badge">debug</span></div>
+        <span id="status" class="status">Getting ready</span>
         <span class="metrics" id="metrics"></span>
-        <button id="restart">Restart</button>
-        <button id="settings">Settings</button>
+        <button id="settings" title="Configure agent & LLM">${ICONS.gear} Settings</button>
+        <button id="restart" title="Restart the engine">${ICONS.restart} Restart</button>
       </header>
       <main>
-        <section class="pipeline">
-          <h3>Voice pipeline</h3>
-          <div class="stages">
-            <div class="stage">VAD · Built-in</div>
-            <div class="arrow">→</div>
-            <div class="stage">STT · Built-in</div>
-            <div class="arrow">→</div>
-            <div class="stage">LLM · <span id="llm-model">—</span></div>
-            <div class="arrow">→</div>
-            <div class="stage">TTS · Built-in</div>
-          </div>
-        </section>
         <section class="conversation">
-          <h3>Conversation</h3>
-          <div id="messages"></div>
+          <div class="panel-head">
+            <h3>Conversation</h3>
+            <button id="clear" title="Clear transcript">Clear</button>
+          </div>
+          <div id="messages" class="messages"></div>
         </section>
-        <section class="events">
-          <h3>Engine events</h3>
-          <pre id="logs">Waiting for the Chirpy agent…</pre>
-        </section>
+        <aside class="side">
+          <div class="panel pipeline">
+            <h3>Voice pipeline</h3>
+            <div class="stages">
+              <div class="stage">VAD</div>
+              <div class="arrow">→</div>
+              <div class="stage">STT</div>
+              <div class="arrow">→</div>
+              <div class="stage">LLM</div>
+              <div class="arrow">→</div>
+              <div class="stage">TTS</div>
+            </div>
+            <div class="pipeline-detail">
+              <div><span>STT</span><b>faster-whisper</b></div>
+              <div><span>TTS</span><b>Kokoro</b></div>
+              <div><span>VAD</span><b>Silero</b></div>
+              <div><span>Noise</span><b>DTLN</b></div>
+            </div>
+          </div>
+          <div class="panel llm">
+            <h3>LLM</h3>
+            <div class="llm-info">
+              <div><span>Endpoint</span><b id="llm-url">—</b></div>
+              <div><span>Model</span><b id="llm-model">—</b></div>
+            </div>
+          </div>
+          <div class="panel logs">
+            <div class="panel-head">
+              <h3>Logs</h3>
+              <button id="open-logs" title="Open log files">Open</button>
+            </div>
+            <pre id="logs">Waiting for the Chirpy agent…</pre>
+          </div>
+        </aside>
       </main>
     </div>
   `;
@@ -341,22 +390,71 @@ function renderDebug() {
     await invoke("restart_backend", { config: engineEnvironment() });
   };
   document.getElementById("settings")!.onclick = () => openSettings();
+  document.getElementById("clear")!.onclick = () => {
+    messages.length = 0;
+    const box = document.getElementById("messages");
+    if (box) box.innerHTML = "";
+  };
+  document.getElementById("open-logs")!.onclick = () => invoke("open_logs");
 }
+
+function appendMessage(m: ChatMessage) {
+  const box = document.getElementById("messages");
+  if (!box) return;
+  const el = document.createElement("div");
+  el.className = `msg ${m.role} ${m.state}`;
+  el.innerHTML = `
+    <div class="msg-meta"><span class="who">${m.role === "user" ? "You" : "Chirpy"}</span><span class="time">${m.time}</span></div>
+    <div class="msg-text">${escapeHtml(m.text) || (m.state === "streaming" ? "…" : "")}</div>
+  `;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+  return el;
+}
+
+function updateLastAssistant(delta: string) {
+  const box = document.getElementById("messages");
+  if (!box) return;
+  const last = box.lastElementChild as HTMLElement | null;
+  if (last && last.classList.contains("assistant")) {
+    const textEl = last.querySelector(".msg-text");
+    if (textEl) textEl.textContent = (textEl.textContent || "") + delta;
+    box.scrollTop = box.scrollHeight;
+  }
+}
+
+function finishLastAssistant() {
+  const box = document.getElementById("messages");
+  if (!box) return;
+  const last = box.lastElementChild as HTMLElement | null;
+  if (last && last.classList.contains("assistant")) {
+    last.classList.remove("streaming");
+    last.classList.add("completed");
+  }
+}
+
+function escapeHtml(s: string) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+}
+
+// ---------------------------------------------------------------------------
+// Settings modal
+// ---------------------------------------------------------------------------
 
 function openSettings() {
   const modal = document.createElement("div");
   modal.className = "modal";
   modal.innerHTML = `
     <div class="modal-box">
-      <h2>Configure Agent & LLM</h2>
+      <h2>Configure Agent &amp; LLM</h2>
       <label>Agent name <input id="s-name" /></label>
       <label>System prompt <textarea id="s-prompt" rows="8"></textarea></label>
-      <label>API endpoint <input id="s-url" /></label>
-      <label>Model <input id="s-model" /></label>
-      <label>API key <input id="s-key" type="password" /></label>
+      <label>API endpoint <input id="s-url" placeholder="http://localhost:1234/v1" /></label>
+      <label>Model <input id="s-model" placeholder="e.g. your-model-id" /></label>
+      <label>API key <input id="s-key" type="password" placeholder="optional for local endpoints" /></label>
       <div class="modal-actions">
         <button id="s-cancel">Cancel</button>
-        <button id="s-save">Save & Restart</button>
+        <button id="s-save">Save &amp; Restart</button>
       </div>
     </div>
   `;
@@ -379,15 +477,9 @@ function openSettings() {
   document.body.appendChild(modal);
 }
 
-function appendMessage(m: ChatMessage) {
-  const box = document.getElementById("messages");
-  if (!box) return;
-  const el = document.createElement("div");
-  el.className = `msg ${m.role}`;
-  el.textContent = m.text || (m.state === "streaming" ? "Preparing a reply…" : "");
-  box.appendChild(el);
-  box.scrollTop = box.scrollHeight;
-}
+// ---------------------------------------------------------------------------
+// Polling
+// ---------------------------------------------------------------------------
 
 async function pollStatus() {
   const status = await invoke<{
@@ -419,23 +511,39 @@ async function pollLogs() {
   if (el) el.textContent = logs;
 }
 
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
 async function init() {
   await loadSettings();
   await invoke("start_backend", { config: engineEnvironment() }).catch((e) => {
     console.error("start_backend failed", e);
   });
+
   if (isDebug) {
     renderDebug();
     setInterval(pollStatus, 1000);
     setInterval(pollMetrics, 1000);
     setInterval(pollLogs, 1000);
-    session.onMessage = appendMessage;
+    session.onUserMessage = (text) => {
+      messages.push({ role: "user", text, time: now(), state: "completed" });
+      appendMessage(messages[messages.length - 1]);
+    };
+    session.onAssistantStart = () => {
+      messages.push({ role: "assistant", text: "", time: now(), state: "streaming" });
+      appendMessage(messages[messages.length - 1]);
+    };
+    session.onAssistantDelta = (delta) => updateLastAssistant(delta);
+    session.onAssistantEnd = () => finishLastAssistant();
     session.onStatus = (s) => {
       const el = document.getElementById("status");
       if (el) el.textContent = s;
     };
     const model = document.getElementById("llm-model");
     if (model) model.textContent = settings.llmModel || "—";
+    const url = document.getElementById("llm-url");
+    if (url) url.textContent = settings.llmURL || "—";
   } else {
     renderOrb();
     session.onStatus = (s) => {

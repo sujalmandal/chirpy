@@ -25,6 +25,7 @@
       {
         "label": "debug",
         "title": "Chirpy Debug",
+        "url": "index.html?window=debug",
         "width": 1080,
         "height": 780,
         "minWidth": 980,

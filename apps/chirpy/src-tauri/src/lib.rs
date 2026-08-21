@@ -8,6 +8,7 @@ use livekit_api::access_token::{AccessToken, VideoGrants};
 use livekit_api::services::LiveKitApi;
 use livekit_protocol as proto;
 use serde::Serialize;
+use tauri::Manager;
 
 const LIVEKIT_URL: &str = "ws://127.0.0.1:7880";
 const LIVEKIT_API_KEY: &str = "devkey";
@@ -293,6 +294,26 @@ fn keychain_delete(account: String) -> Result<(), String> {
     entry.delete_credential().map_err(|_| "not found".into())
 }
 
+#[tauri::command]
+fn open_debug(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("debug") {
+        win.show().map_err(|e| e.to_string())?;
+        win.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn open_logs() -> Result<(), String> {
+    let dir = project_root().join("logs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Command::new("open")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -309,7 +330,9 @@ pub fn run() {
             system_metrics,
             keychain_get,
             keychain_set,
-            keychain_delete
+            keychain_delete,
+            open_debug,
+            open_logs
         ])
         .setup(|app| {
             let _ = app;
