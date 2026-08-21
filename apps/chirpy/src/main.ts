@@ -111,6 +111,7 @@ class VoiceSession {
   onSpeaking: (b: boolean) => void = () => {};
   onListening: (b: boolean) => void = () => {};
   onUserMessage: (text: string) => void = () => {};
+  onUserPartial: (text: string) => void = () => {};
   onAssistantStart: () => void = () => {};
   onAssistantDelta: (delta: string) => void = () => {};
   onAssistantEnd: () => void = () => {};
@@ -235,6 +236,7 @@ class VoiceSession {
       case "partial":
         this.transcript = (event.text as string) ?? "";
         this.onTranscript(this.transcript);
+        this.onUserPartial(this.transcript);
         break;
       case "user":
         this.transcript = (event.text as string) ?? "";
@@ -434,6 +436,30 @@ function finishLastAssistant() {
   }
 }
 
+// Update the in-progress user message as the user speaks (partial), or finalize
+// it once the transcript is committed. Creates the user bubble lazily.
+function updateLastUser(text: string, final: boolean) {
+  const box = document.getElementById("messages");
+  if (!box) return;
+  let last = box.lastElementChild as HTMLElement | null;
+  let m = messages[messages.length - 1];
+  if (!last || !last.classList.contains("user") || m?.state !== "streaming") {
+    m = { role: "user", text: "", time: now(), state: "streaming" };
+    messages.push(m);
+    last = appendMessage(m);
+  }
+  if (!last) return;
+  const textEl = last.querySelector(".log-text");
+  if (textEl) textEl.textContent = text || (final ? "" : "▍");
+  m.text = text;
+  if (final) {
+    last.classList.remove("streaming");
+    last.classList.add("completed");
+    m.state = "completed";
+  }
+  tailScroll(box);
+}
+
 function escapeHtml(s: string) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
 }
@@ -547,8 +573,10 @@ async function init() {
     // The debug window observes the conversation via events broadcast by the
     // main window (which owns the voice session).
     listen("conversation-user", (e) => {
-      messages.push({ role: "user", text: e.payload as string, time: now(), state: "completed" });
-      appendMessage(messages[messages.length - 1]);
+      updateLastUser(e.payload as string, true);
+    });
+    listen("conversation-user-partial", (e) => {
+      updateLastUser(e.payload as string, false);
     });
     listen("conversation-assistant-delta", (e) => {
       // Create the assistant bubble lazily on the first delta.
@@ -586,6 +614,7 @@ async function init() {
     };
     // Broadcast the conversation to the debug window.
     session.onUserMessage = (text) => emit("conversation-user", text);
+    session.onUserPartial = (text) => emit("conversation-user-partial", text);
     session.onAssistantDelta = (delta) => emit("conversation-assistant-delta", delta);
     session.onAssistantEnd = () => emit("conversation-assistant-end", null);
     setInterval(pollStatus, 1000);
