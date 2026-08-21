@@ -232,6 +232,14 @@ class SpeechToText:
         self.gen = self._new_gen()
         self.buffer = bytearray()
         self.audio_tokenizer.reset()
+        # The Lm model keeps a KV cache shared across LmGen instances; it must be
+        # cleared too or the next step overflows its fixed max_seq_len window and
+        # every block errors with "narrow invalid args" (the stall where speech is
+        # no longer transcribed).
+        for c in self.lm.transformer_cache:
+            c.reset()
+        for c in self.lm.depformer_cache:
+            c.reset()
 
     def step(self, pcm_float32: bytes) -> tuple[str | None, float]:
         """Feed arbitrary-size PCM bytes; returns (new text fragment, VAD prob).
@@ -371,6 +379,7 @@ class Agent:
         self.cancel_flag = False
         self.playback_started = 0.0
         self.last_k_update = 0.0
+        self.last_rms_log = 0.0
         # Audio/text accounting (per turn + per session).
         self.turn_audio_bytes = 0
         self.turn_audio_seconds = 0.0
@@ -514,6 +523,10 @@ class Agent:
             if time.time() < grace_until:
                 continue
 
+            if DEBUG and time.time() - self.last_rms_log >= 1.0:
+                self.last_rms_log = time.time()
+                debug(f"stt: idle rms={rms:.4f} speech_run={speech_run} silence_run={silence_run} fragments={len(fragments)}")
+
             try:
                 fragment, _vad = await self._mlx(stt.step, pcm)
             except Exception as error:
@@ -533,6 +546,14 @@ class Agent:
                 silence_run = 0
             else:
                 silence_run += 1
+            # The STT LmGen has a finite step window (~8192 blocks); it steps on
+            # idle silence too, so reset it during long silences to avoid the
+            # "narrow invalid args" overflow that would otherwise stall listening
+            # after ~11 minutes.
+            if silence_run >= 120 and not fragments:
+                await self._mlx(stt.reset)
+                speech_run = 0
+                silence_run = 0
             if speech_run >= 4 and silence_run >= 4:
                 transcript = await self._finalize(stt, fragments)
                 fragments = []
