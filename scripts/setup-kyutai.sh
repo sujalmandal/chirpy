@@ -19,5 +19,5 @@ echo "==> Running smoke test (downloads model weights + synthesizes a phrase)"
 "$venv_python" "$engine_dir/validate.py"
 
 echo ""
-echo "Setup complete. Build the app with scripts/build-local-moshi-app.sh,"
+echo "Setup complete. Build the app with scripts/build-local-voice-assistant-app.sh,"
 echo "then open 'Local Voice Assistant.app'."

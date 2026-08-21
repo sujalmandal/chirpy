@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct LocalMoshiApp: App {
+struct LocalVoiceAssistantApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var engine = KyutaiEngine()
     @StateObject private var settings = AppSettings()
