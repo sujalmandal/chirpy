@@ -1,73 +1,31 @@
 # Local Voice Assistant
 
-A native, real-time voice assistant for Apple Silicon Macs. The default interface is a borderless floating orb; right-click it to open a detailed debug workspace.
+Local Voice Assistant is a local-first, real-time voice interface for Apple Silicon Macs. It combines a focused native macOS experience with on-device speech processing and an OpenAI-compatible reasoning endpoint of your choice.
 
-Speech recognition, voice activity detection, and speech synthesis run locally. Only text conversation data is sent to the OpenAI-compatible LLM endpoint you configure.
+The primary interface is a borderless floating orb designed for continuous conversation. A dedicated Debug Mode provides the conversation timeline, operational telemetry, and runtime configuration needed to inspect and tune the voice pipeline.
 
-## Features
+## Highlights
 
-- Floating orb with loading, listening, idle, and speaking animations
-- Live user transcript and assistant reply that fade automatically
-- Natural turn detection and barge-in while the assistant is speaking
-- Configurable agent name, system instructions, LLM endpoint, model, and API key
-- Unified, timestamped conversation view in Debug Mode
-- Turn-aware engine logs with endpoint and cancellation reasons
-- Local Apple Silicon speech pipeline using MLX
-- API credentials stored in the macOS Keychain
+- Local speech recognition, voice activity detection, and speech synthesis on Apple Silicon
+- Streaming conversation with interruption support: speak while the assistant is responding to take the floor
+- Floating, borderless voice interface with distinct connecting, listening, idle, and speaking states
+- Live transcript and reply captions that clear automatically
+- Configurable assistant identity, behavior, endpoint, model, and credentials
+- Timestamped conversation history and turn-level diagnostic logs
+- Credentials stored in the macOS Keychain
 
-## Requirements
-
-- Apple Silicon Mac
-- macOS 14 or later
-- Homebrew Python 3.12 at `/opt/homebrew/bin/python3.12`
-- An OpenAI-compatible chat-completions endpoint, such as LM Studio
-- Internet access during initial setup to download the speech model weights
-
-The initial model download is several gigabytes. Later runs use the local Hugging Face cache.
-
-## Install and run
-
-Set up the Python environment and validate the local speech models:
-
-```bash
-scripts/setup-kyutai.sh
-```
-
-Build and open the native app:
-
-```bash
-scripts/build-local-voice-assistant-app.sh
-open "Local Voice Assistant.app"
-```
-
-macOS asks for microphone access on first launch. Changing the bundle identifier or rebuilding with a different signing identity can make macOS treat the build as a new app and request permission again.
-
-## Configure the assistant
-
-Right-click the orb and choose **Open Debug Mode**. In **Configuration**, enter:
-
-- **Agent name** — included in the assistant's system context
-- **System instructions** — defines its behavior and response style
-- **API endpoint** — the OpenAI-compatible base URL
-- **Model** — the model name expected by that endpoint
-- **API key** — optional for local endpoints; stored in Keychain
-
-Choose **Save & Restart** to apply the settings. For LM Studio, a typical endpoint is `http://localhost:1234/v1`.
-
-You can also copy `config/local.env.example` to `config/local.env` and edit it directly. The local file is ignored by Git.
-
-## Architecture
+## Data flow and architecture
 
 ```mermaid
 flowchart LR
-    mic[Microphone] -->|24 kHz Float32 PCM| app
+    microphone[Microphone] -->|24 kHz Float32 PCM| app
 
     subgraph mac[Your Mac]
-        app[SwiftUI floating orb and debug UI]
+        app[Native SwiftUI application]
         engine[Local Python voice engine]
         stt[Kyutai STT and semantic VAD]
         tts[Kyutai streaming TTS]
-        speakers[Audio playback]
+        output[Audio playback]
 
         app -->|binary WebSocket audio| engine
         engine --> stt
@@ -75,52 +33,90 @@ flowchart LR
         engine --> tts
         tts -->|cancellable PCM audio| engine
         engine -->|binary WebSocket audio| app
-        app --> speakers
+        app --> output
     end
 
     engine -->|text conversation over HTTPS| llm[OpenAI-compatible LLM endpoint]
     llm -->|streaming reply text| engine
-
-    app -.->|settings and debug events| engine
+    app -.->|configuration and debug events| engine
 ```
 
-The Swift app owns the window, microphone capture, audio playback, connection state, transient captions, settings, and debug UI. It starts and stops the Python engine with the app.
+The macOS app manages the interface, microphone capture, audio playback, settings, and debug workspace. The local engine keeps the MLX speech models warm, detects the end of a user turn, streams the resulting text to the configured LLM, and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
 
-The Python engine keeps the MLX speech models loaded, converts microphone audio into text, detects the end of each user turn, streams the transcript to the configured LLM, synthesizes the reply, and returns PCM audio. A new user turn can cancel an active assistant turn, enabling barge-in without restarting the models.
+The app and engine exchange JSON state/text events and binary audio frames over a local WebSocket. Engine readiness is exposed through a local HTTP health endpoint.
 
-The two processes communicate through a small protocol: JSON events carry state and text, while binary WebSocket frames carry audio. Readiness is exposed separately over local HTTP.
+## Requirements
 
-## Debugging
+- Apple Silicon Mac
+- macOS 14 or later
+- Homebrew Python 3.12 at `/opt/homebrew/bin/python3.12`
+- An OpenAI-compatible chat-completions endpoint, such as LM Studio or a hosted provider
+- Internet access for the initial speech-model download
 
-Right-click the orb and open **Debug Mode** to see:
+The initial setup downloads approximately 6.4 GB of model weights. They are subsequently loaded from the local Hugging Face cache.
 
-- The unified user and assistant conversation with timestamps and turn IDs
-- Engine readiness and local system metrics
-- Turn ownership, VAD endpoint decisions, cancellations, and failure reasons
+## Quick start
+
+Install the local engine, its dependencies, and validate the speech stack:
+
+```bash
+scripts/setup-kyutai.sh
+```
+
+Build and launch the native application:
+
+```bash
+scripts/build-local-voice-assistant-app.sh
+open "Local Voice Assistant.app"
+```
+
+macOS requests microphone access on first launch. A changed bundle identifier or signing identity is treated as a new application by macOS and can require permission again.
+
+## Configuration
+
+Right-click the floating orb and select **Open Debug Mode**. In the configuration panel, set:
+
+- **Agent name** — included in the system context
+- **System instructions** — response style and behavior
+- **API endpoint** — the OpenAI-compatible base URL
+- **Model** — model identifier accepted by the endpoint
+- **API key** — optional for local endpoints; stored in Keychain
+
+Select **Save & Restart** to apply changes. For a local LM Studio server, use an endpoint such as `http://localhost:1234/v1`.
+
+For unattended or repeatable setup, copy `config/local.env.example` to `config/local.env` and set the same values there. The local configuration file is excluded from Git.
+
+## Operations and diagnostics
+
+Debug Mode is the operational view for the assistant. It includes:
+
+- A unified user/assistant transcript with timestamps and turn IDs
+- Engine status and local system metrics
+- Explicit VAD endpoint decisions, turn ownership, and cancellation sources
 - LLM and agent configuration
 
-Persistent logs are written to:
+Log files are written to:
 
-- `logs/kyutai-agent.log` — Python engine and turn lifecycle
-- `logs/local-voice-assistant.log` — native app process output
+- `logs/kyutai-agent.log` — engine startup, voice turns, and cancellation lifecycle
+- `logs/local-voice-assistant.log` — native application process output
 
-The local health endpoint is `http://127.0.0.1:8999/health`; the audio session uses `ws://127.0.0.1:9000`.
+For local integration diagnostics, the engine health endpoint is `http://127.0.0.1:8999/health` and its WebSocket service is `ws://127.0.0.1:9000`.
 
-## Project structure
+## Privacy
+
+Audio capture, VAD, transcription, and speech synthesis stay on the Mac. The configured LLM receives text conversation data, including the assistant context necessary to sustain a conversation. Use a local endpoint for a fully local text path, or review the data policy of any hosted provider before use.
+
+## Repository layout
 
 ```text
 apps/LocalVoiceAssistant/   Native SwiftUI macOS application
 engine/kyutai/              Local STT, VAD, LLM, and TTS engine
 config/                     Example local configuration
-scripts/                    Setup and app build scripts
+scripts/                    Setup and application build scripts
 ```
 
-The upstream Kyutai MLX runtime remains an internal speech-engine dependency. It is not used in the app, target, executable, or bundle naming.
-
-## Privacy
-
-Microphone audio, VAD, STT, and TTS stay on the Mac. The completed transcript and conversation context are sent to the configured LLM endpoint, which may be local or remote. Review your endpoint provider's data policy before using a hosted service.
+The Kyutai MLX runtime is an internal speech-engine dependency; it is not part of the application or bundle naming.
 
 ## License
 
-This project is available under the [MIT License](LICENSE).
+Distributed under the [MIT License](LICENSE).
