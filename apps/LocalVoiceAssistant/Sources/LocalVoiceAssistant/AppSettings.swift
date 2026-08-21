@@ -51,9 +51,43 @@ final class AppSettings: ObservableObject {
     }
 
     private let defaults = UserDefaults.standard
-    private static let promptVersion = 2
+    private static let promptVersion = 3
     private static let defaultBehavior = "Be concise, warm, and natural. Prefer short spoken answers unless the user asks for detail."
     private static let identityPrompt = "You are {{agent_name}}, the voice assistant. {{agent_name}} is your name, never the user's name. The user's name is unknown unless they explicitly provide it. Never greet or address the user as {{agent_name}}."
+    private static let previousDefaultSystemPrompt = "\(identityPrompt)\n\n\(defaultBehavior)"
+    static let defaultSystemPrompt = """
+    You are {{agent_name}}, an AI voice assistant.
+
+    Identity rules:
+
+    - Your name is {{agent_name}}.
+    - {{agent_name}} always refers to you, the assistant, not the user.
+    - The user's name is unknown unless they explicitly tell you their name.
+    - Never call, greet, or address the user as {{agent_name}}.
+    - Do not assume the user's name from the conversation, system instructions, metadata, or examples.
+    - If the user provides their name, remember it for the conversation and use it only when natural.
+    - If you are uncertain who a name refers to, ask for clarification instead of guessing.
+
+    Conversation style:
+
+    - Speak in a warm, natural, and confident manner.
+    - Keep responses concise and suitable for spoken conversation.
+    - Prefer one or two short paragraphs unless the user requests detail.
+    - Answer directly without unnecessary introductions, repeated greetings, or restating the question.
+    - Do not introduce yourself repeatedly. Mention your name only when asked or when contextually useful.
+    - Avoid overly formal language, filler phrases, and repetitive acknowledgements.
+    - Use clear sentences that sound natural when spoken aloud.
+    - Ask only one clarification question at a time when more information is required.
+    - If the user interrupts or changes the subject, follow their latest request naturally.
+
+    Accuracy and behavior:
+
+    - Do not invent facts, personal details, or conversation history.
+    - Clearly acknowledge uncertainty when you do not know something.
+    - Correct misunderstandings briefly and respectfully.
+    - Follow the user's requested language and communication style when possible.
+    - Provide longer explanations only when requested or when additional detail is necessary for safety or correctness.
+    """
 
     @Published var mode: AppMode { didSet { defaults.set(mode.rawValue, forKey: Key.mode) } }
     @Published var agentName: String { didSet { defaults.set(agentName, forKey: Key.agentName) } }
@@ -69,14 +103,18 @@ final class AppSettings: ObservableObject {
         llmModel = defaults.string(forKey: Key.llmModel) ?? "liquid/lfm2.5-1.2b"
         llmAPIKey = KeychainStore.read(account: "llm-api-key") ?? ""
         let storedPrompt = defaults.string(forKey: Key.systemPrompt)
-        if defaults.integer(forKey: Key.systemPromptVersion) < Self.promptVersion {
+        let storedVersion = defaults.integer(forKey: Key.systemPromptVersion)
+        if storedVersion < 2 {
             let previousBehavior = storedPrompt ?? Self.defaultBehavior
             systemPrompt = "\(Self.identityPrompt)\n\n\(previousBehavior)"
-            defaults.set(systemPrompt, forKey: Key.systemPrompt)
-            defaults.set(Self.promptVersion, forKey: Key.systemPromptVersion)
+        } else if storedVersion < Self.promptVersion,
+                  storedPrompt == nil || storedPrompt == Self.previousDefaultSystemPrompt {
+            systemPrompt = Self.defaultSystemPrompt
         } else {
-            systemPrompt = storedPrompt ?? "\(Self.identityPrompt)\n\n\(Self.defaultBehavior)"
+            systemPrompt = storedPrompt ?? Self.defaultSystemPrompt
         }
+        defaults.set(systemPrompt, forKey: Key.systemPrompt)
+        defaults.set(Self.promptVersion, forKey: Key.systemPromptVersion)
     }
 
     var validationIssues: [String] {
@@ -114,6 +152,10 @@ final class AppSettings: ObservableObject {
     func persistCredential() {
         if llmAPIKey.isEmpty { KeychainStore.delete(account: "llm-api-key") }
         else { KeychainStore.write(llmAPIKey, account: "llm-api-key") }
+    }
+
+    func resetSystemPromptToDefault() {
+        systemPrompt = Self.defaultSystemPrompt
     }
 }
 

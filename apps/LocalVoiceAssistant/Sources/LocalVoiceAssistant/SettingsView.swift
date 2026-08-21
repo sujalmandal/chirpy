@@ -100,13 +100,20 @@ private struct LLMSettingsForm: View {
                         TextField("Nova", text: $settings.agentName).frame(width: 320)
                     }
                     LabeledContent("System prompt") {
-                        TextEditor(text: $settings.systemPrompt)
-                            .font(.body)
-                            .frame(width: 500, height: 180)
-                            .padding(6)
-                            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .trailing, spacing: 8) {
+                            TextEditor(text: $settings.systemPrompt)
+                                .font(.body)
+                                .frame(width: 500, height: 220)
+                                .padding(6)
+                                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                            Button("Reset to Default") {
+                                settings.resetSystemPromptToDefault()
+                            }
+                            .buttonStyle(.bordered)
+                            .help("Replace the current system prompt with the built-in default")
+                        }
                     }
-                    Text("This is the complete system message sent to the LLM. Use {{agent_name}} wherever the configured agent name should appear.")
+                    Text("This complete system message is saved automatically and persists across app restarts. Use {{agent_name}} wherever the configured agent name should appear.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
