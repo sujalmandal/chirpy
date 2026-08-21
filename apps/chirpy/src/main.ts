@@ -5,6 +5,10 @@ import { load } from "@tauri-apps/plugin-store";
 import { Room, RoomEvent, Track } from "livekit-client";
 import "./styles.css";
 
+// Suppress the webview's default right-click context menu (which includes
+// Reload/Inspect) — Chirpy has its own controls.
+window.addEventListener("contextmenu", (e) => e.preventDefault());
+
 const LIVEKIT_URL = "ws://127.0.0.1:7880";
 const ROOM_NAME = "chirpy";
 
@@ -289,11 +293,13 @@ function renderOrb() {
       </div>
       <div class="caption" id="transcript"></div>
       <div class="caption reply" id="reply"></div>
-      <div class="controls">
-        <button id="mic" title="Toggle microphone">${ICONS.mic}</button>
-        <button id="speaker" title="Mute speaker">${ICONS.speaker}</button>
+      <div class="controls top-right">
         <button id="debug" title="Open debug mode">${ICONS.debug}</button>
         <button id="quit" title="Quit Chirpy">${ICONS.quit}</button>
+      </div>
+      <div class="controls under-orb">
+        <button id="mic" title="Toggle microphone">${ICONS.mic}</button>
+        <button id="speaker" title="Mute speaker">${ICONS.speaker}</button>
       </div>
     </div>
   `;

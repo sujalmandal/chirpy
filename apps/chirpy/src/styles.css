@@ -48,7 +48,7 @@ button {
 
 .orb-wrap {
   position: absolute;
-  top: 50%;
+  top: 44%;
   left: 50%;
   transform: translate(-50%, -50%);
 }
@@ -108,11 +108,11 @@ button {
 }
 
 #transcript {
-  top: calc(50% + 72px);
+  top: calc(44% + 70px);
 }
 
 #reply {
-  top: calc(50% + 100px);
+  top: calc(44% + 98px);
 }
 
 .caption.visible {
@@ -124,12 +124,22 @@ button {
 }
 
 .controls {
-  position: absolute;
-  top: 18px;
-  right: 18px;
   display: flex;
   gap: 10px;
   -webkit-app-region: no-drag;
+}
+
+.controls.top-right {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+}
+
+.controls.under-orb {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
 }
 
 .controls button {
