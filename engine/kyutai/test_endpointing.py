@@ -1,6 +1,6 @@
 import unittest
 
-from endpointing import EndpointDetector, EndpointState
+from endpointing import BargeInGate, EndpointDetector, EndpointState
 
 
 class EndpointDetectorTests(unittest.TestCase):
@@ -120,6 +120,41 @@ class EndpointDetectorTests(unittest.TestCase):
         for _ in range(7):
             detector.observe(rms=0.08, semantic_probability=0.1, has_recognized_text=False)
         self.assertLess(detector.energy_threshold, baseline * 1.25)
+
+
+class BargeInGateTests(unittest.TestCase):
+    def test_short_echo_spike_does_not_interrupt(self):
+        gate = BargeInGate(blind_ms=1200, min_speech_ms=640)
+        for index in range(5):
+            interrupted = gate.observe(
+                elapsed_ms=1200 + index * 80, rms=0.09, threshold=0.05
+            )
+        self.assertFalse(interrupted)
+
+    def test_sustained_residual_signal_interrupts(self):
+        gate = BargeInGate(blind_ms=1200, min_speech_ms=640)
+        results = [
+            gate.observe(elapsed_ms=1200 + index * 80, rms=0.09, threshold=0.05)
+            for index in range(8)
+        ]
+        self.assertEqual(results, [False] * 7 + [True])
+
+    def test_quiet_block_resets_speech_evidence(self):
+        gate = BargeInGate(blind_ms=1200, min_speech_ms=640)
+        for index in range(6):
+            gate.observe(elapsed_ms=1200 + index * 80, rms=0.09, threshold=0.05)
+        gate.observe(elapsed_ms=1680, rms=0.02, threshold=0.05)
+        for index in range(6):
+            interrupted = gate.observe(
+                elapsed_ms=1760 + index * 80, rms=0.09, threshold=0.05
+            )
+        self.assertFalse(interrupted)
+
+    def test_blind_period_does_not_accumulate_evidence(self):
+        gate = BargeInGate(blind_ms=1200, min_speech_ms=640)
+        for index in range(12):
+            gate.observe(elapsed_ms=index * 80, rms=0.09, threshold=0.05)
+        self.assertEqual(gate.run, 0)
 
 
 if __name__ == "__main__":

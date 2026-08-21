@@ -42,7 +42,7 @@ from moshi_mlx.models.tts import TTSModel, DEFAULT_DSM_TTS_REPO, DEFAULT_DSM_TTS
 from moshi_mlx.utils import Sampler
 from moshi_mlx.utils.loaders import hf_get
 
-from endpointing import EndpointDetector
+from endpointing import BargeInGate, EndpointDetector
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "config" / "local.env"
@@ -560,7 +560,14 @@ class Agent:
         self.played_now = 0.0
         self.coupling_k: float | None = None
         self.coupling_samples: list[float] = []
-        self.barge_run = 0
+        self.barge_gate = BargeInGate(
+            blind_ms=int(config.get("BARGE_IN_BLIND_MS", "1200")),
+            min_speech_ms=int(config.get("BARGE_IN_MIN_SPEECH_MS", "640")),
+        )
+        self.barge_min_rms = float(config.get("BARGE_IN_MIN_RMS", "0.05"))
+        self.barge_echo_multiplier = float(
+            config.get("BARGE_IN_ECHO_MULTIPLIER", "4.0")
+        )
         self.cancel_flag = False
         self.playback_started = 0.0
         self.last_k_update = 0.0
@@ -660,8 +667,14 @@ class Agent:
             await self._mlx(Agent.stt.reset)
         self.current_turn_id = None
 
-    async def _barge_in(self):
+    async def _barge_in(self, *, rms: float, threshold: float, played: float):
         """Cancel the assistant because VAD detected user speech over playback."""
+        log(
+            f"turn={self.current_turn_id or '-'} owner=user state=barge_in_detected "
+            f"evidence=sustained_residual_energy mic_rms={rms:.4f} "
+            f"threshold={threshold:.4f} played_rms={played:.4f} "
+            f"required_ms={self.barge_gate.required_blocks * self.barge_gate.block_ms}"
+        )
         await self._cancel_current_turn("vad_barge_in", "user", reset_stt=True)
         debug("barge-in: assistant turn cancelled, STT reset")
 
@@ -730,22 +743,24 @@ class Agent:
                     if ratio < self.coupling_k * 1.5:
                         self.coupling_k = max(0.1, self.coupling_k * 0.9 + ratio * 0.1)
                         self.last_k_update = time.time()
-                threshold = 0.05
+                threshold = self.barge_min_rms
                 if self.coupling_k is not None:
-                    threshold = max(0.05, self.coupling_k * played * 3.0)
-                # Blind period: never trigger barge-in in the first 1.0 s of
-                # playback (needed to learn the echo level).
-                if elapsed >= 1.0:
-                    if rms > threshold:
-                        self.barge_run += 1
-                        if self.barge_run >= 3:
-                            await self._barge_in()
-                            self.barge_run = 0
-                            grace_until = time.time() + 0.3
-                    else:
-                        self.barge_run = 0
-                if DEBUG and self.barge_run > 0:
-                    debug(f"barge-in: mic={rms:.4f} played={played:.4f} k={self.coupling_k} thr={threshold:.4f} run={self.barge_run}")
+                    echo_reference = max(played, played_delayed)
+                    threshold = max(
+                        threshold,
+                        self.coupling_k * echo_reference * self.barge_echo_multiplier,
+                    )
+                if self.barge_gate.observe(
+                    elapsed_ms=elapsed * 1000.0, rms=rms, threshold=threshold
+                ):
+                    await self._barge_in(rms=rms, threshold=threshold, played=played)
+                    grace_until = time.time() + 0.3
+                if DEBUG and self.barge_gate.run > 0:
+                    debug(
+                        f"barge-in: mic={rms:.4f} played={played:.4f} "
+                        f"k={self.coupling_k} thr={threshold:.4f} "
+                        f"run={self.barge_gate.run}/{self.barge_gate.required_blocks}"
+                    )
                 continue
 
             # --- Grace period after barge-in (let echo tail die) ------------
@@ -879,7 +894,7 @@ class Agent:
         self.cancel_flag = False
         self.coupling_k = None
         self.coupling_samples = []
-        self.barge_run = 0
+        self.barge_gate.reset()
         self.played_now = 0.0
         self.last_k_update = 0.0
         self.turn_audio_bytes = 0

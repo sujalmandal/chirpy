@@ -196,3 +196,33 @@ class EndpointDetector:
                 else (self.blocks_seen - self.last_text_block) * self.block_ms
             ),
         )
+
+
+class BargeInGate:
+    """Require sustained residual microphone energy before interrupting TTS.
+
+    WebRTC echo cancellation can still leave short output-correlated spikes.
+    Treating a few such blocks as user speech cuts the assistant off, so this
+    gate deliberately requires a continuous signal after an initial blind
+    period. Recognized speech remains a separate, immediate interruption path.
+    """
+
+    block_ms = 80
+
+    def __init__(self, *, blind_ms: int = 1200, min_speech_ms: int = 640):
+        self.blind_ms = max(0, blind_ms)
+        self.required_blocks = max(1, math.ceil(min_speech_ms / self.block_ms))
+        self.run = 0
+
+    def reset(self) -> None:
+        self.run = 0
+
+    def observe(self, *, elapsed_ms: float, rms: float, threshold: float) -> bool:
+        if elapsed_ms < self.blind_ms or rms <= threshold:
+            self.run = 0
+            return False
+        self.run += 1
+        if self.run < self.required_blocks:
+            return False
+        self.run = 0
+        return True
