@@ -125,7 +125,7 @@ button {
 
 .controls {
   position: absolute;
-  bottom: 18px;
+  top: 18px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;

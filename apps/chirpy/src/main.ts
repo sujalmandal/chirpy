@@ -365,7 +365,6 @@ function renderDebug() {
       <section class="logs-panel">
         <div class="panel-head">
           <h3>Logs</h3>
-          <button id="open-logs" title="Open log files">Open</button>
         </div>
         <pre id="logs">Waiting for the Chirpy agent…</pre>
       </section>
@@ -380,7 +379,6 @@ function renderDebug() {
     const box = document.getElementById("messages");
     if (box) box.innerHTML = "";
   };
-  document.getElementById("open-logs")!.onclick = () => invoke("open_logs");
 }
 
 function appendMessage(m: ChatMessage) {
