@@ -58,17 +58,30 @@ You can also copy `config/local.env.example` to `config/local.env` and edit it d
 
 ## Architecture
 
-```text
-Microphone
-   │  24 kHz Float32 PCM
-   ▼
-SwiftUI app ──WebSocket──▶ local Python engine
-                              │
-                              ├─ Kyutai STT + semantic/energy VAD
-                              ├─ OpenAI-compatible streaming LLM
-                              └─ Kyutai streaming TTS
-   ▲                              │
-   └──── cancellable PCM audio ───┘
+```mermaid
+flowchart LR
+    mic[Microphone] -->|24 kHz Float32 PCM| app
+
+    subgraph mac[Your Mac]
+        app[SwiftUI floating orb and debug UI]
+        engine[Local Python voice engine]
+        stt[Kyutai STT and semantic VAD]
+        tts[Kyutai streaming TTS]
+        speakers[Audio playback]
+
+        app -->|binary WebSocket audio| engine
+        engine --> stt
+        stt -->|completed transcript| engine
+        engine --> tts
+        tts -->|cancellable PCM audio| engine
+        engine -->|binary WebSocket audio| app
+        app --> speakers
+    end
+
+    engine -->|text conversation over HTTPS| llm[OpenAI-compatible LLM endpoint]
+    llm -->|streaming reply text| engine
+
+    app -.->|settings and debug events| engine
 ```
 
 The Swift app owns the window, microphone capture, audio playback, connection state, transient captions, settings, and debug UI. It starts and stops the Python engine with the app.
