@@ -67,7 +67,7 @@ struct KyutaiConversationView: View {
     private var engineSummary: some View {
         GroupBox("Current engine") {
             VStack(alignment: .leading, spacing: 6) {
-                row("VAD", "Built-in semantic and silence endpoint detection")
+                row("VAD", "Silero acoustic gate with Kyutai semantic endpointing")
                 row("STT", "Built-in Kyutai streaming speech recognition")
                 row("LLM", "OpenAI-compatible endpoint")
                 row("TTS", "Built-in Kyutai streaming speech synthesis")

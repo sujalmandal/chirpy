@@ -20,6 +20,69 @@ class EndpointState(str, Enum):
 
 
 @dataclass(frozen=True)
+class AcousticGateEvent:
+    kind: str
+    speech_ms: int
+    silence_ms: int
+    probability: float
+
+
+class AcousticSpeechGate:
+    """Turn streaming speech probabilities into stable start/end events."""
+
+    def __init__(
+        self,
+        *,
+        block_ms: int = 80,
+        start_threshold: float = 0.60,
+        end_threshold: float = 0.35,
+        start_ms: int = 160,
+        end_ms: int = 480,
+    ):
+        self.block_ms = max(1, block_ms)
+        self.start_threshold = min(1.0, max(0.0, start_threshold))
+        self.end_threshold = min(self.start_threshold, max(0.0, end_threshold))
+        self.start_blocks = max(1, round(start_ms / self.block_ms))
+        self.end_blocks = max(1, round(end_ms / self.block_ms))
+        self.reset()
+
+    def reset(self) -> None:
+        self.speaking = False
+        self.start_run = 0
+        self.end_run = 0
+        self.speech_blocks = 0
+
+    def observe(self, probability: float) -> AcousticGateEvent | None:
+        probability = min(1.0, max(0.0, probability))
+        if not self.speaking:
+            self.start_run = self.start_run + 1 if probability >= self.start_threshold else 0
+            if self.start_run < self.start_blocks:
+                return None
+            self.speaking = True
+            self.speech_blocks = self.start_run
+            self.end_run = 0
+            return AcousticGateEvent(
+                kind="started",
+                speech_ms=self.speech_blocks * self.block_ms,
+                silence_ms=0,
+                probability=probability,
+            )
+
+        self.speech_blocks += 1
+        self.end_run = self.end_run + 1 if probability <= self.end_threshold else 0
+        if self.end_run < self.end_blocks:
+            return None
+        event = AcousticGateEvent(
+            kind="ended",
+            speech_ms=max(0, self.speech_blocks - self.end_run) * self.block_ms,
+            silence_ms=self.end_run * self.block_ms,
+            probability=probability,
+        )
+        self.reset()
+        return event
+
+
+@dataclass(frozen=True)
 class EndpointDecision:
     reason: str
     speech_ms: int

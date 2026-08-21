@@ -2,10 +2,10 @@
 """Local voice agent built on Kyutai STT 1B (semantic VAD) + an
 OpenAI-compatible LLM + Kyutai TTS 1.6B (MLX).
 
-STT and semantic VAD run continuously in a dedicated MLX CPU process while TTS
-runs on the GPU in the main process. The Swift client streams microphone audio
-over WebSocket and receives streamed text events plus decoded 24 kHz Float32
-mono PCM frames for playback.
+Silero VAD runs continuously through ONNX Runtime on CPU. It gates Kyutai STT,
+which shares a serial MLX GPU lane with TTS and receives only speech, buffered
+pre-roll, and trailing silence. The Swift client streams microphone audio over
+WebSocket and receives text events plus decoded 24 kHz Float32 mono PCM.
 
 Wire protocol:
   client -> agent : binary Float32 LE mono 24 kHz PCM, 1920-sample (80 ms) blocks
@@ -32,6 +32,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import onnxruntime as ort
 import rustymimi
 import sentencepiece
 import websockets
@@ -44,7 +45,9 @@ from moshi_mlx.utils import Sampler
 from moshi_mlx.utils.loaders import hf_get
 
 from endpointing import (
+    AcousticSpeechGate,
     BargeInGate,
+    EndpointDecision,
     EndpointDetector,
     is_probable_playback_echo,
     recognized_barge_in_ready,
@@ -58,6 +61,12 @@ BLOCK_SAMPLES = 1_920  # 80 ms
 BLOCK_BYTES = BLOCK_SAMPLES * 4  # Float32
 FLUSH_BLOCKS = 8  # ~0.64 s of silence to drain the STT's 0.5 s output delay
 _SILENCE = np.zeros(BLOCK_SAMPLES, dtype=np.float32).tobytes()
+SILERO_SAMPLE_RATE = 16_000
+SILERO_CHUNK_SAMPLES = 512  # 32 ms at 16 kHz
+SILERO_MODEL_URL = (
+    "https://raw.githubusercontent.com/snakers4/silero-vad/"
+    "v6.2.1/src/silero_vad/data/silero_vad.onnx"
+)
 
 HISTORY: dict[str, list[dict[str, str]]] = {}
 
@@ -117,9 +126,12 @@ def load_config() -> dict[str, str]:
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 values[key.strip()] = value.strip()
-    # Explicit process environment always wins. The macOS app supplies its
-    # persisted UI settings here, while local.env remains a CLI-friendly fallback.
-    values.update(os.environ)
+    # Explicit process environment wins, but an empty value is treated as unset
+    # and falls back to local.env. The macOS app supplies its persisted UI
+    # settings (some empty) here, while local.env remains a CLI-friendly fallback.
+    for key, value in os.environ.items():
+        if value:
+            values[key] = value
     return values
 
 
@@ -345,14 +357,18 @@ class HealthHandler(BaseHTTPRequestHandler):
             return
         cfg = _READY["config"]
         stt = getattr(Agent, "stt", None)
-        stt_alive = bool(stt and stt.is_alive())
+        vad = getattr(Agent, "vad", None)
         payload = {
             "status": "ok",
             "service": "kyutai-voice-agent",
-            "stt_ready": _READY["stt_ready"] and stt_alive,
+            "stt_ready": _READY["stt_ready"],
             "tts_ready": _READY["tts_ready"],
-            "stt_device": "cpu",
-            "stt_continuous": True,
+            "stt_device": "gpu",
+            "stt_gated": True,
+            "vad_device": "cpu",
+            "vad_ready": bool(vad),
+            "vad_last_step_ms": round(getattr(vad, "last_step_ms", 0.0), 2),
+            "vad_max_step_ms": round(getattr(vad, "max_step_ms", 0.0), 2),
             "stt_last_step_ms": round(getattr(stt, "last_step_ms", 0.0), 1),
             "stt_max_step_ms": round(getattr(stt, "max_step_ms", 0.0), 1),
             "llm_configured": bool(cfg.get("LLM_BASE_URL") and cfg.get("LLM_MODEL_NAME")),
@@ -375,6 +391,81 @@ class HealthHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # STT pipeline (streaming, semantic VAD)
 # ---------------------------------------------------------------------------
+
+class SileroVAD:
+    """Small streaming ONNX VAD that always runs on the CPU."""
+
+    def __init__(self, config: dict[str, str]):
+        configured_path = config.get("SILERO_VAD_MODEL", "").strip()
+        model_path = (
+            Path(configured_path).expanduser()
+            if configured_path
+            else ROOT / "engine" / "kyutai" / ".models" / "silero_vad.onnx"
+        )
+        if not model_path.exists():
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            download_path = model_path.with_suffix(".onnx.download")
+            url = config.get("SILERO_VAD_URL", SILERO_MODEL_URL).strip()
+            log("VAD: downloading Silero ONNX model")
+            with urllib.request.urlopen(url, timeout=90) as response, open(download_path, "wb") as output:
+                while chunk := response.read(1024 * 1024):
+                    output.write(chunk)
+            os.replace(download_path, model_path)
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        self.session = ort.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        self.last_step_ms = 0.0
+        self.max_step_ms = 0.0
+        self.reset()
+        log(f"VAD ready (Silero ONNX CPU, model={model_path.name})")
+
+    def reset(self) -> None:
+        self.state = np.zeros((2, 1, 128), dtype=np.float32)
+        self.context = np.zeros((1, 64), dtype=np.float32)
+        self.buffer = np.empty(0, dtype=np.float32)
+
+    def step(self, pcm_float32: bytes) -> float:
+        started = time.monotonic()
+        samples = np.frombuffer(pcm_float32, dtype=np.float32)
+        if not samples.size:
+            return 0.0
+        # Input arrives at 24 kHz. Every 80 ms block maps exactly to 1280
+        # samples at 16 kHz, so block-local interpolation does not drift.
+        output_count = round(samples.size * SILERO_SAMPLE_RATE / SAMPLE_RATE)
+        source_positions = np.arange(output_count, dtype=np.float32) * (
+            SAMPLE_RATE / SILERO_SAMPLE_RATE
+        )
+        downsampled = np.interp(
+            source_positions,
+            np.arange(samples.size, dtype=np.float32),
+            samples,
+        ).astype(np.float32)
+        self.buffer = np.concatenate((self.buffer, downsampled))
+        probabilities: list[float] = []
+        while self.buffer.size >= SILERO_CHUNK_SAMPLES:
+            chunk = self.buffer[:SILERO_CHUNK_SAMPLES]
+            self.buffer = self.buffer[SILERO_CHUNK_SAMPLES:]
+            model_input = np.concatenate((self.context, chunk.reshape(1, -1)), axis=1)
+            output, self.state = self.session.run(
+                None,
+                {
+                    "input": model_input,
+                    "state": self.state,
+                    "sr": np.array(SILERO_SAMPLE_RATE, dtype=np.int64),
+                },
+            )
+            self.context = model_input[:, -64:]
+            probabilities.append(float(output[0, 0]))
+        self.last_step_ms = (time.monotonic() - started) * 1000.0
+        self.max_step_ms = max(self.max_step_ms, self.last_step_ms)
+        return max(probabilities, default=0.0)
 
 class SpeechToText:
     def __init__(self, config: dict[str, str]):
@@ -413,6 +504,8 @@ class SpeechToText:
         self.lm.warmup()
         self.buffer = bytearray()
         self.gen = self._new_gen()
+        self.last_step_ms = 0.0
+        self.max_step_ms = 0.0
 
     def _new_gen(self):
         return models.LmGen(
@@ -454,6 +547,7 @@ class SpeechToText:
         bytes are available. Returns (None, 0.0) when a full block is not yet
         buffered.
         """
+        started = time.monotonic()
         self.buffer += pcm_float32
         if len(self.buffer) < BLOCK_BYTES:
             return None, 0.0
@@ -472,6 +566,8 @@ class SpeechToText:
         if extra_heads and len(extra_heads) > 2:
             vad_prob = extra_heads[2][0, 0, 0].item()
         self.blocks_since_hard_reset += 1
+        self.last_step_ms = (time.monotonic() - started) * 1000.0
+        self.max_step_ms = max(self.max_step_ms, self.last_step_ms)
         return fragment, vad_prob
 
 
@@ -692,14 +788,24 @@ class Agent:
         self.config = config
         self.ws = websocket
         self.session_id = str(uuid.uuid4())
-        # CPU STT can occasionally run slower than the 80 ms capture cadence.
-        # Keep only a short live window rather than letting several seconds of
-        # stale audio delay barge-in and end-of-turn decisions.
-        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue(
-            maxsize=max(4, int(config.get("MIC_QUEUE_BLOCKS", "8")))
-        )
+        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
         self.mic_blocks_dropped = 0
         self.last_mic_drop_log = 0.0
+        pre_roll_ms = int(config.get("VAD_PRE_ROLL_MS", "480"))
+        self.pre_roll: deque[bytes] = deque(
+            maxlen=max(2, round(pre_roll_ms / 80))
+        )
+        self.speech_gate = AcousticSpeechGate(
+            start_threshold=float(config.get("VAD_START_THRESHOLD", "0.60")),
+            end_threshold=float(config.get("VAD_END_THRESHOLD", "0.35")),
+            start_ms=int(config.get("VAD_START_MS", "160")),
+            end_ms=int(config.get("VAD_END_MS", "480")),
+        )
+        self.stt_active = False
+        self.fast_vad_probability = 0.0
+        self.fast_vad_barge_blind_ms = int(
+            config.get("VAD_BARGE_IN_BLIND_MS", "240")
+        )
         self.tts_queue: asyncio.Queue = asyncio.Queue()
         self.current_turn: asyncio.Task | None = None
         self.current_turn_id: int | None = None
@@ -762,9 +868,13 @@ class Agent:
         return await loop.run_in_executor(MLX_EXECUTOR, fn, *args)
 
     async def _stt(self, fn, *args):
-        """Call the continuous CPU STT process without blocking asyncio."""
+        """Run gated Kyutai STT on the shared GPU lane."""
+        return await self._mlx(fn, *args)
+
+    async def _vad(self, pcm: bytes) -> float:
+        """Run the lightweight streaming VAD on its independent CPU lane."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(STT_EXECUTOR, fn, *args)
+        return await loop.run_in_executor(STT_EXECUTOR, Agent.vad.step, pcm)
 
     async def out_writer(self):
         while True:
@@ -1061,6 +1171,187 @@ class Agent:
                     self.run_turn(transcript, turn_id, decision.reason)
                 )
 
+    async def gated_stt_loop(self):
+        """Gate GPU STT with the always-on CPU VAD and preserve speech audio."""
+        stt = Agent.stt
+        fragments: list[str] = []
+        discard_epoch = self.stt_discard_epoch
+        while True:
+            if self.session_id != Agent.active_session_id:
+                return
+            try:
+                pcm = await asyncio.wait_for(self.mic_queue.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+
+            if discard_epoch != self.stt_discard_epoch:
+                fragments.clear()
+                self.endpoint.reset()
+                self.speech_gate.reset()
+                Agent.vad.reset()
+                self.pre_roll.clear()
+                self.stt_active = False
+                discard_epoch = self.stt_discard_epoch
+
+            samples = np.frombuffer(pcm, dtype=np.float32)
+            rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+            try:
+                self.fast_vad_probability = await self._vad(pcm)
+            except Exception as error:
+                _READY["stt_error"] = f"VAD failed: {error}"
+                log(f"VAD step error: {error}")
+                await asyncio.sleep(0.1)
+                continue
+
+            gate_event = self.speech_gate.observe(self.fast_vad_probability)
+            if not self.stt_active:
+                self.pre_roll.append(pcm)
+
+            # A confirmed acoustic onset is deliberately independent from the
+            # 1B transcriber's delayed first token. Stop playback first, then
+            # replay pre-roll into STT after the shared GPU lane is available.
+            if not self.stt_active and self.speech_gate.speaking:
+                if self.playback_active:
+                    elapsed_ms = (time.time() - self.playback_started) * 1000.0
+                    if elapsed_ms < self.fast_vad_barge_blind_ms:
+                        continue
+                    if not self.aec_enabled and rms < self.barge_min_rms:
+                        debug(
+                            "barge-in: Silero onset awaiting residual energy "
+                            f"prob={self.fast_vad_probability:.3f} rms={rms:.4f}"
+                        )
+                        continue
+                    log(
+                        f"turn={self.current_turn_id or '-'} owner=user "
+                        "state=barge_in_detected evidence=silero_vad "
+                        f"probability={self.fast_vad_probability:.3f} "
+                        f"speech_ms={self.speech_gate.speech_blocks * 80} "
+                        f"aec={self.aec_enabled}"
+                    )
+                    await self._cancel_current_turn(
+                        "acoustic_vad_barge_in", "user", reset_stt=True
+                    )
+                elif self.current_turn is not None and not self.current_turn.done():
+                    await self._cancel_current_turn(
+                        "new_speech_during_assistant_turn", "user", reset_stt=True
+                    )
+                else:
+                    await self._stt(stt.reset)
+
+                self.stt_active = True
+                frames = list(self.pre_roll)
+                self.pre_roll.clear()
+                log(
+                    "turn=- owner=user state=speech_started source=silero_vad "
+                    f"probability={self.fast_vad_probability:.3f} "
+                    f"pre_roll_blocks={len(frames)}"
+                )
+            elif self.stt_active:
+                frames = [pcm]
+            else:
+                continue
+
+            decision = None
+            latest_semantic_probability = 0.0
+            try:
+                for frame in frames:
+                    frame_samples = np.frombuffer(frame, dtype=np.float32)
+                    frame_rms = (
+                        float(np.sqrt(np.mean(frame_samples * frame_samples)))
+                        if frame_samples.size else 0.0
+                    )
+                    fragment, latest_semantic_probability = await self._stt(stt.step, frame)
+                    if fragment:
+                        fragments.append(fragment)
+                        partial = "".join(fragments).strip()
+                        if partial:
+                            await self.send_event(type="partial", text=partial)
+                    has_text = bool("".join(fragments).strip())
+                    decision = self.endpoint.observe(
+                        rms=frame_rms,
+                        semantic_probability=latest_semantic_probability,
+                        has_recognized_text=has_text,
+                        new_recognized_text=bool(fragment and has_text),
+                    )
+                    if decision:
+                        break
+            except Exception as error:
+                self.stt_error_streak += 1
+                _READY["stt_ready"] = False
+                _READY["stt_error"] = str(error)
+                _READY["stt_error_count"] += 1
+                log(f"STT step error: {error}; performing hard recovery")
+                try:
+                    await self._stt(stt.reset, True)
+                    _READY["stt_last_recovery"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                except Exception as reset_error:
+                    _READY["stt_error"] = f"Recovery failed: {reset_error}"
+                    log(f"STT hard recovery failed: {reset_error}")
+                fragments.clear()
+                self.endpoint.reset()
+                self.speech_gate.reset()
+                Agent.vad.reset()
+                self.pre_roll.clear()
+                self.stt_active = False
+                continue
+
+            if self.stt_error_streak:
+                log(f"STT recovered after {self.stt_error_streak} failed block(s)")
+                self.stt_error_streak = 0
+                _READY["stt_error"] = None
+                _READY["stt_ready"] = True
+
+            # Kyutai's semantic head may finish first. Otherwise the acoustic
+            # gate ends after sustained silence and we flush delayed text.
+            if decision is None and gate_event is not None and gate_event.kind == "ended":
+                decision = EndpointDecision(
+                    reason="acoustic_vad",
+                    speech_ms=gate_event.speech_ms,
+                    silence_ms=gate_event.silence_ms,
+                    semantic_probability=latest_semantic_probability,
+                    smoothed_probability=self.endpoint.smoothed_probability,
+                    energy_threshold=self.endpoint.energy_threshold,
+                    token_age_ms=(
+                        None if self.endpoint.last_text_block is None
+                        else (self.endpoint.blocks_seen - self.endpoint.last_text_block) * 80
+                    ),
+                )
+            if decision is None:
+                continue
+
+            transcript = await self._finalize(stt, fragments)
+            fragments = []
+            self.endpoint.reset()
+            self.speech_gate.reset()
+            Agent.vad.reset()
+            self.pre_roll.clear()
+            self.stt_active = False
+            while not self.mic_queue.empty():
+                self.mic_queue.get_nowait()
+            if not transcript:
+                log(
+                    "turn=- owner=user state=discarded reason=empty_transcript "
+                    f"endpoint={decision.reason} speech_ms={decision.speech_ms} "
+                    f"silence_ms={decision.silence_ms}"
+                )
+                continue
+            if self.current_turn is not None and not self.current_turn.done():
+                await self._cancel_current_turn("new_user_turn_detected", "user")
+            Agent.next_turn_id += 1
+            turn_id = Agent.next_turn_id
+            self.current_turn_id = turn_id
+            log(
+                f"turn={turn_id} owner=user state=completed endpoint={decision.reason} "
+                f"speech_ms={decision.speech_ms} silence_ms={decision.silence_ms} "
+                f"vad_raw={decision.semantic_probability:.3f} "
+                f"vad_smooth={decision.smoothed_probability:.3f} "
+                f"acoustic_probability={self.fast_vad_probability:.3f} "
+                f"token_age_ms={decision.token_age_ms} transcript={transcript!r}"
+            )
+            self.current_turn = asyncio.create_task(
+                self.run_turn(transcript, turn_id, decision.reason)
+            )
+
     async def _finalize(self, stt, fragments: list[str]) -> str:
         """Feed trailing silence to flush the delayed STT output, then reset."""
         for _ in range(FLUSH_BLOCKS):
@@ -1188,7 +1479,7 @@ class Agent:
             await self.ws.close(code=1013, reason="A voice session is already active")
             return
         Agent.active_session_id = self.session_id
-        stt_task = asyncio.create_task(self.stt_loop())
+        stt_task = asyncio.create_task(self.gated_stt_loop())
         writer_task = asyncio.create_task(self.out_writer())
         try:
             async for message in self.ws:
@@ -1252,7 +1543,8 @@ class Agent:
                         self.current_reply_text = ""
                         self.barge_energy_confirmed_until = 0.0
                         self.stt_discard_epoch += 1
-                        await self._stt(Agent.stt.reset)
+                        if not self.stt_active:
+                            await self._stt(Agent.stt.reset)
                         self.endpoint.reset()
         except websockets.ConnectionClosed:
             pass
@@ -1283,37 +1575,29 @@ def main():
     port = int(config.get("AGENT_PORT", "8999"))
     ws_port = port + 1
 
-    log("Loading Kyutai models (first run downloads weights)…")
+    log("Loading local voice models (first run downloads weights)…")
     if DEBUG:
         log("debug logging enabled")
-    vad_repo = config.get("VAD_REPO", config.get("STT_REPO", "")).strip()
-    stt_repo = config.get("STT_REPO", "kyutai/stt-1b-en_fr-candle").strip()
-    if vad_repo and vad_repo != stt_repo:
-        log(f"VAD model {vad_repo!r} selected; using the semantic VAD head bundled with {stt_repo!r} until a matching adapter is installed")
-    stt_worker = SpeechToTextWorker(config)
-    Agent.stt = stt_worker
+    Agent.vad = SileroVAD(config)
+    mx.set_default_device(mx.gpu)
+    Agent.stt = SpeechToText(config)
     _READY["stt_ready"] = True
-    log("STT ready (continuous CPU worker)")
-    try:
-        mx.set_default_device(mx.gpu)
-        Agent.tts = TextToSpeech(config)
-        _READY["tts_ready"] = True
-        log("TTS ready (MLX GPU)")
+    log("STT ready (Kyutai MLX GPU, acoustic-VAD gated)")
+    Agent.tts = TextToSpeech(config)
+    _READY["tts_ready"] = True
+    log("TTS ready (MLX GPU)")
 
-        threading.Thread(
-            target=lambda: ThreadingHTTPServer(("127.0.0.1", port), HealthHandler).serve_forever(),
-            daemon=True,
-        ).start()
-        log(f"Health on http://127.0.0.1:{port}/health · WebSocket on ws://127.0.0.1:{ws_port}")
+    threading.Thread(
+        target=lambda: ThreadingHTTPServer(("127.0.0.1", port), HealthHandler).serve_forever(),
+        daemon=True,
+    ).start()
+    log(f"Health on http://127.0.0.1:{port}/health · WebSocket on ws://127.0.0.1:{ws_port}")
 
-        async def serve():
-            async with websockets.serve(lambda ws: Agent(config, ws).run(), "127.0.0.1", ws_port):
-                await asyncio.Future()
+    async def serve():
+        async with websockets.serve(lambda ws: Agent(config, ws).run(), "127.0.0.1", ws_port):
+            await asyncio.Future()
 
-        asyncio.run(serve())
-    finally:
-        _READY["stt_ready"] = False
-        stt_worker.close()
+    asyncio.run(serve())
 
 
 if __name__ == "__main__":

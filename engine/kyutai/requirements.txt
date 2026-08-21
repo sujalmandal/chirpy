@@ -3,4 +3,5 @@ mlx
 rustymimi==0.4.1
 sentencepiece
 numpy
+onnxruntime==1.29.0
 websockets

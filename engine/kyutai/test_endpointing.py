@@ -1,12 +1,42 @@
 import unittest
 
 from endpointing import (
+    AcousticSpeechGate,
     BargeInGate,
     EndpointDetector,
     EndpointState,
     is_probable_playback_echo,
     recognized_barge_in_ready,
 )
+
+
+class AcousticSpeechGateTests(unittest.TestCase):
+    def test_requires_sustained_probability_to_start(self):
+        gate = AcousticSpeechGate(start_ms=160, end_ms=480)
+        self.assertIsNone(gate.observe(0.8))
+        started = gate.observe(0.8)
+        self.assertEqual(started.kind, "started")
+        self.assertTrue(gate.speaking)
+
+    def test_short_probability_dip_does_not_end_speech(self):
+        gate = AcousticSpeechGate(start_ms=160, end_ms=480)
+        gate.observe(0.8)
+        gate.observe(0.8)
+        for _ in range(5):
+            self.assertIsNone(gate.observe(0.1))
+        self.assertTrue(gate.speaking)
+        self.assertIsNone(gate.observe(0.8))
+
+    def test_sustained_silence_ends_speech(self):
+        gate = AcousticSpeechGate(start_ms=160, end_ms=480)
+        gate.observe(0.8)
+        gate.observe(0.8)
+        ended = None
+        for _ in range(6):
+            ended = gate.observe(0.1)
+        self.assertEqual(ended.kind, "ended")
+        self.assertEqual(ended.silence_ms, 480)
+        self.assertFalse(gate.speaking)
 
 
 class EndpointDetectorTests(unittest.TestCase):

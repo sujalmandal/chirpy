@@ -39,8 +39,13 @@ final class AppSettings: ObservableObject {
     }
 
     private enum FixedVoicePipeline {
-        static let vadRepo = "kyutai/stt-1b-en_fr-candle"
+        static let vadRepo = "snakers4/silero-vad"
         static let vadThreshold = 0.01
+        static let vadStartThreshold = 0.60
+        static let vadEndThreshold = 0.35
+        static let vadStartMS = 160
+        static let vadEndMS = 480
+        static let vadPreRollMS = 480
         static let minSpeechMS = 320
         static let minSilenceMS = 800
         static let sttRepo = "kyutai/stt-1b-en_fr-candle"
@@ -100,7 +105,7 @@ final class AppSettings: ObservableObject {
         mode = AppMode(rawValue: defaults.string(forKey: Key.mode) ?? "") ?? .assistant
         agentName = defaults.string(forKey: Key.agentName) ?? "Nova"
         llmURL = defaults.string(forKey: Key.llmURL) ?? "http://localhost:1234/v1"
-        llmModel = defaults.string(forKey: Key.llmModel) ?? "liquid/lfm2.5-1.2b"
+        llmModel = defaults.string(forKey: Key.llmModel) ?? ""
         llmAPIKey = KeychainStore.read(account: "llm-api-key") ?? ""
         let storedPrompt = defaults.string(forKey: Key.systemPrompt)
         let storedVersion = defaults.integer(forKey: Key.systemPromptVersion)
@@ -136,6 +141,11 @@ final class AppSettings: ObservableObject {
             "ASSISTANT_SYSTEM": resolvedSystemPrompt,
             "VAD_REPO": FixedVoicePipeline.vadRepo,
             "VAD_THRESHOLD": String(FixedVoicePipeline.vadThreshold),
+            "VAD_START_THRESHOLD": String(FixedVoicePipeline.vadStartThreshold),
+            "VAD_END_THRESHOLD": String(FixedVoicePipeline.vadEndThreshold),
+            "VAD_START_MS": String(FixedVoicePipeline.vadStartMS),
+            "VAD_END_MS": String(FixedVoicePipeline.vadEndMS),
+            "VAD_PRE_ROLL_MS": String(FixedVoicePipeline.vadPreRollMS),
             "VAD_MIN_SPEECH_MS": String(FixedVoicePipeline.minSpeechMS),
             "VAD_MIN_SILENCE_MS": String(FixedVoicePipeline.minSilenceMS),
             "STT_REPO": FixedVoicePipeline.sttRepo,

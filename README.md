@@ -24,12 +24,14 @@ flowchart LR
     subgraph mac[Your Mac]
         app[Native SwiftUI application]
         engine[Local Python voice engine]
-        stt[Continuous Kyutai STT and semantic VAD<br/>dedicated MLX CPU process]
-        tts[Kyutai streaming TTS<br/>MLX GPU process]
+        vad[Continuous Silero acoustic VAD<br/>ONNX CPU]
+        stt[Gated Kyutai STT and semantic endpointing<br/>MLX GPU]
+        tts[Kyutai streaming TTS<br/>MLX GPU]
         output[Audio playback]
 
         app -->|binary WebSocket audio| engine
-        engine --> stt
+        engine -->|every microphone block| vad
+        vad -->|speech plus buffered pre-roll| stt
         stt -->|completed transcript| engine
         engine --> tts
         tts -->|cancellable PCM audio| engine
@@ -42,7 +44,7 @@ flowchart LR
     app -.->|configuration and debug events| engine
 ```
 
-The macOS app manages the native interface, settings, and debug workspace. A visually hidden local WebKit surface keeps microphone capture and assistant playback in one WebRTC/WebAudio graph so acoustic echo cancellation has the correct playback reference. Kyutai STT and its semantic VAD stay active in a dedicated MLX CPU process even while the separate GPU process synthesizes speech. A bounded live microphone window prevents slower CPU inference from accumulating seconds of stale audio. The engine fuses recognized speech, semantic pause prediction, playback-aware echo evidence, and an adaptive room-noise floor to manage turns. A confirmed new user turn cancels active generation and playback without unloading either speech model.
+The macOS app manages the native interface, settings, and debug workspace. A visually hidden local WebKit surface keeps microphone capture and assistant playback in one WebRTC/WebAudio graph so acoustic echo cancellation has the correct playback reference. Silero VAD evaluates every microphone block on CPU and keeps a short pre-roll buffer. When speech begins, the engine stops active playback and passes the complete buffered utterance to Kyutai STT on the GPU. Kyutai's semantic head then distinguishes a completed thought from a short pause. This keeps the latency-critical interruption path independent from the much larger transcription model without discarding spoken audio.
 
 The app and engine exchange JSON state/text events and binary audio frames over a local WebSocket. Engine readiness is exposed through a local HTTP health endpoint.
 
@@ -93,7 +95,7 @@ Debug Mode is the operational view for the assistant. It includes:
 
 - A unified user/assistant transcript with timestamps and turn IDs
 - Engine status and local system metrics
-- Continuous CPU STT/VAD health and step latency, endpoint decisions, raw and smoothed pause scores, adaptive thresholds, turn ownership, and cancellation sources
+- Continuous CPU VAD health and latency, gated GPU STT timing, endpoint decisions, semantic pause scores, turn ownership, and cancellation sources
 - LLM and agent configuration
 
 Log files are written to:
