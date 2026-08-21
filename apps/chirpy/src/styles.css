@@ -126,8 +126,7 @@ button {
 .controls {
   position: absolute;
   top: 18px;
-  left: 50%;
-  transform: translateX(-50%);
+  right: 18px;
   display: flex;
   gap: 10px;
   -webkit-app-region: no-drag;
