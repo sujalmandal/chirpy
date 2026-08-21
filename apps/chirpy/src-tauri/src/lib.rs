@@ -89,8 +89,7 @@ fn start_backend(state: tauri::State<Mutex<BackendState>>, config: serde_json::V
         let (file, path) = open_log(&log_dir, "livekit-server.log")?;
         let mut cmd = Command::new("livekit-server");
         cmd.arg("--dev")
-            .arg("--log-level")
-            .arg("info")
+            .env("LIVEKIT_LOG_LEVEL", "info")
             .current_dir(&root)
             .stdout(Stdio::from(file.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(file));
