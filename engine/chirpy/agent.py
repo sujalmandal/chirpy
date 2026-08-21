@@ -108,6 +108,7 @@ async def entrypoint(ctx: JobContext):
             device=config.get("STT_DEVICE", "cpu"),
             compute_type=config.get("STT_COMPUTE_TYPE", "int8"),
             language=config.get("STT_LANGUAGE", "en"),
+            interim_interval=float(config.get("STT_INTERIM_INTERVAL", "0.6")),
         ),
         tts=KokoroTTS(
             lang_code=config.get("TTS_LANG", "a"),
