@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+@preconcurrency import WebKit
 import Foundation
 
 enum VoiceChatRole: String {
@@ -23,7 +24,7 @@ struct VoiceChatMessage: Identifiable, Equatable {
 }
 
 @MainActor
-final class KyutaiSession: NSObject, ObservableObject {
+final class KyutaiSession: NSObject, ObservableObject, WKScriptMessageHandler, WKUIDelegate, WKNavigationDelegate {
     @Published private(set) var status = "Waiting for microphone permission"
     @Published private(set) var transcript = ""
     @Published private(set) var reply = ""
@@ -47,6 +48,12 @@ final class KyutaiSession: NSObject, ObservableObject {
     private var tapInstalled = false
     private var voiceProcessingEnabled = false
     private var voiceProcessingWatchdog: Task<Void, Never>?
+    private var webCaptureWatchdog: Task<Void, Never>?
+    private var preferWebCapture = true
+    private var webCaptureReady = false
+    private var webEchoCancellation = false
+    private var webAudioBlocks = 0
+    private var webFallbackInProgress = false
 
     private let pcmLock = NSLock()
     private var pcmBuffer = Data()
@@ -57,6 +64,19 @@ final class KyutaiSession: NSObject, ObservableObject {
     private var turnDone = false
     private var pendingUserMessageID: UUID?
     private var activeAssistantMessageID: UUID?
+
+    lazy var webMicrophoneView: WKWebView = {
+        let controller = WKUserContentController()
+        controller.add(self, name: "microphoneBridge")
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController = controller
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.uiDelegate = self
+        view.navigationDelegate = self
+        view.setValue(false, forKey: "drawsBackground")
+        return view
+    }()
 
     override init() {
         recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
@@ -71,11 +91,11 @@ final class KyutaiSession: NSObject, ObservableObject {
         if permission == .notDetermined {
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 Task { @MainActor in
-                    granted ? self?.beginListening() : self?.setDeniedStatus()
+                    granted ? self?.beginPreferredListening() : self?.setDeniedStatus()
                 }
             }
         } else if permission == .authorized {
-            beginListening()
+            beginPreferredListening()
         } else {
             setDeniedStatus()
         }
@@ -85,7 +105,33 @@ final class KyutaiSession: NSObject, ObservableObject {
         status = "Microphone permission denied — allow it in System Settings > Privacy & Security > Microphone, then restart."
     }
 
-    private func beginListening(enableVoiceProcessing: Bool = false) {
+    private func beginPreferredListening() {
+        if preferWebCapture { beginWebListening() }
+        else { beginNativeListening() }
+    }
+
+    private func beginWebListening() {
+        do {
+            webCaptureReady = false
+            webEchoCancellation = false
+            webAudioBlocks = 0
+            webFallbackInProgress = false
+            audioEngine.prepare()
+            try audioEngine.start()
+            player.play()
+            isListening = true
+            status = "Starting echo-cancelled microphone…"
+            connect()
+            startSending()
+            let url = URL(string: "http://127.0.0.1:8999/microphone?\(UUID().uuidString)")!
+            webMicrophoneView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
+            startWebCaptureWatchdog()
+        } catch {
+            fallbackToNativeCapture(reason: "Web microphone output setup failed")
+        }
+    }
+
+    private func beginNativeListening(enableVoiceProcessing: Bool = false) {
         let input = audioEngine.inputNode
         do {
             // Voice processing gives the endpoint detector an echo-cancelled
@@ -148,6 +194,8 @@ final class KyutaiSession: NSObject, ObservableObject {
     func stop() {
         sendTask?.cancel(); sendTask = nil
         voiceProcessingWatchdog?.cancel(); voiceProcessingWatchdog = nil
+        webCaptureWatchdog?.cancel(); webCaptureWatchdog = nil
+        webMicrophoneView.evaluateJavaScript("window.stopCapture?.()")
         reconnectTask?.cancel(); reconnectTask = nil
         disconnect()
         if tapInstalled {
@@ -161,6 +209,37 @@ final class KyutaiSession: NSObject, ObservableObject {
         reconnectAttempt = 0
         micLevel = 0; speakerLevel = 0
         isListening = false; isSpeaking = false; status = "Conversation stopped"
+    }
+
+    private func startWebCaptureWatchdog() {
+        webCaptureWatchdog?.cancel()
+        webCaptureWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(7))
+            guard let self, !Task.isCancelled else { return }
+            guard self.webCaptureReady, self.webEchoCancellation, self.webAudioBlocks > 0 else {
+                self.fallbackToNativeCapture(reason: "WebRTC microphone did not become ready")
+                return
+            }
+        }
+    }
+
+    private func fallbackToNativeCapture(reason: String) {
+        guard !webFallbackInProgress else { return }
+        webFallbackInProgress = true
+        reportCapture(stage: "web_fallback", details: reason)
+        preferWebCapture = false
+        status = "\(reason). Retrying native microphone…"
+        webCaptureWatchdog?.cancel(); webCaptureWatchdog = nil
+        webMicrophoneView.evaluateJavaScript("window.stopCapture?.()")
+        sendTask?.cancel(); sendTask = nil
+        reconnectTask?.cancel(); reconnectTask = nil
+        disconnect()
+        audioEngine.stop()
+        player.stop()
+        pcmLock.withLock { pcmBuffer.removeAll(keepingCapacity: true) }
+        pendingBuffers = 0
+        isListening = false
+        beginNativeListening()
     }
 
     private func startVoiceProcessingWatchdogIfNeeded() {
@@ -193,13 +272,14 @@ final class KyutaiSession: NSObject, ObservableObject {
         pcmLock.withLock { pcmBuffer.removeAll(keepingCapacity: true) }
         pendingBuffers = 0
         isListening = false
-        beginListening(enableVoiceProcessing: false)
+        beginNativeListening(enableVoiceProcessing: false)
     }
 
     func interrupt() {
         guard isSpeaking else { return }
         sendJSON(["type": "interrupt"])
         player.stop()
+        webMicrophoneView.evaluateJavaScript("window.stopPlayback?.()")
         pendingBuffers = 0
         turnDone = false
         isSpeaking = false; status = "Listening…"
@@ -209,6 +289,7 @@ final class KyutaiSession: NSObject, ObservableObject {
         isOutputMuted.toggle()
         if isOutputMuted {
             player.stop()
+            webMicrophoneView.evaluateJavaScript("window.stopPlayback?.()")
             pendingBuffers = 0
             speakerLevel = 0
         } else if isListening {
@@ -221,6 +302,34 @@ final class KyutaiSession: NSObject, ObservableObject {
         // cancellation the assistant's own voice would trigger it). This level
         // just drives the mic waveform in the UI.
         micLevel = level
+    }
+
+    private func acceptWebPCM(_ data: Data) {
+        guard preferWebCapture, webCaptureReady else { return }
+        var level: Float = 0
+        data.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Float.self)
+            guard !samples.isEmpty else { return }
+            var power: Float = 0
+            for sample in samples { power += sample * sample }
+            level = sqrt(power / Float(samples.count))
+        }
+        pcmLock.withLock {
+            pcmBuffer.append(data)
+            webAudioBlocks += 1
+        }
+        if webAudioBlocks == 1 {
+            reportCapture(stage: "first_audio", details: "bytes=\(data.count) level=\(level)")
+        }
+        handleLevel(level)
+    }
+
+    private func reportCapture(stage: String, details: String) {
+        sendJSON([
+            "type": "capture_diagnostic",
+            "stage": stage,
+            "details": details,
+        ])
     }
 
     // -- Audio conversion (render-thread safe) --------------------------------
@@ -264,7 +373,7 @@ final class KyutaiSession: NSObject, ObservableObject {
         task.resume()
         sendJSON([
             "type": "audio_processing",
-            "voice_processing": voiceProcessingEnabled,
+            "voice_processing": webCaptureReady ? webEchoCancellation : voiceProcessingEnabled,
         ])
         status = reconnectAttempt == 0 ? "Connecting to local voice engine…" : "Reconnecting…"
         receive()
@@ -342,6 +451,7 @@ final class KyutaiSession: NSObject, ObservableObject {
                 }
             case "interrupted":
                 player.stop()
+                webMicrophoneView.evaluateJavaScript("window.stopPlayback?.()")
                 pendingBuffers = 0
                 turnDone = false
                 isSpeaking = false
@@ -440,13 +550,36 @@ final class KyutaiSession: NSObject, ObservableObject {
     private func playPCM(_ data: Data) {
         guard !isOutputMuted else { return }
         let frames = data.count / MemoryLayout<Float>.size
-        guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: AVAudioFrameCount(frames)), let samples = buffer.floatChannelData else { return }
-        buffer.frameLength = AVAudioFrameCount(frames)
-        _ = data.withUnsafeBytes { source in memcpy(samples[0], source.baseAddress!, data.count) }
+        guard frames > 0 else { return }
         var power: Float = 0
-        for i in 0..<frames { power += samples[0][i] * samples[0][i] }
+        data.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Float.self)
+            for sample in samples { power += sample * sample }
+        }
         speakerLevel = sqrt(power / Float(frames))
         pendingBuffers += 1
+        if webCaptureReady && webEchoCancellation {
+            let encoded = data.base64EncodedString()
+            webMicrophoneView.evaluateJavaScript("window.playPCM?.('\(encoded)')") { [weak self] result, error in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if error != nil || (result as? Bool) == false {
+                        self.pendingBuffers -= 1
+                        self.fallbackToNativeCapture(reason: "WebRTC playback failed")
+                    }
+                }
+            }
+            return
+        }
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: recordingFormat,
+            frameCapacity: AVAudioFrameCount(frames)
+        ), let samples = buffer.floatChannelData else {
+            pendingBuffers -= 1
+            return
+        }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        _ = data.withUnsafeBytes { source in memcpy(samples[0], source.baseAddress!, data.count) }
         player.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in self?.bufferFinished() }
         }
@@ -463,5 +596,74 @@ final class KyutaiSession: NSObject, ObservableObject {
                 sendJSON(["type": "playback_done"])
             }
         }
+    }
+
+    // -- Hidden WebRTC microphone bridge -------------------------------------
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "microphoneBridge",
+              let body = message.body as? [String: Any],
+              let type = body["type"] as? String else { return }
+        switch type {
+        case "page_ready":
+            reportCapture(stage: "page_ready", details: "starting getUserMedia")
+            webMicrophoneView.evaluateJavaScript("window.startCapture?.()")
+        case "ready":
+            let echoCancellation = body["echoCancellation"] as? Bool ?? false
+            reportCapture(
+                stage: "webrtc_ready",
+                details: "echo=\(echoCancellation) noise=\(body["noiseSuppression"] ?? false) " +
+                    "agc=\(body["autoGainControl"] ?? false) rate=\(body["sampleRate"] ?? "unknown")"
+            )
+            guard echoCancellation else {
+                fallbackToNativeCapture(reason: "WebRTC echo cancellation is unavailable")
+                return
+            }
+            webCaptureReady = true
+            webEchoCancellation = true
+            status = "Listening — WebRTC echo cancellation active"
+            sendJSON(["type": "audio_processing", "voice_processing": true])
+        case "audio":
+            guard let encoded = body["pcm"] as? String,
+                  let data = Data(base64Encoded: encoded),
+                  data.count == blockSamples * MemoryLayout<Float>.size else { return }
+            acceptWebPCM(data)
+        case "playback_block_done":
+            bufferFinished()
+        case "error":
+            let message = body["message"] as? String ?? "unknown WebRTC error"
+            reportCapture(stage: "webrtc_error", details: message)
+            fallbackToNativeCapture(reason: message)
+        default:
+            break
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping (WKPermissionDecision) -> Void
+    ) {
+        decisionHandler(type == .microphone ? .grant : .deny)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        fallbackToNativeCapture(reason: "Web microphone page failed: \(error.localizedDescription)")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        fallbackToNativeCapture(reason: "Web microphone page failed: \(error.localizedDescription)")
     }
 }

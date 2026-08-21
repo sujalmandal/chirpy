@@ -8,6 +8,7 @@ The primary interface is a borderless floating orb designed for continuous conve
 
 - Local speech recognition, adaptive semantic turn detection, and speech synthesis on Apple Silicon
 - Streaming conversation with interruption support: speak while the assistant is responding to take the floor
+- Echo-cancelled WebRTC capture and playback embedded invisibly inside the native macOS interface
 - Floating, borderless voice interface with distinct connecting, listening, idle, and speaking states
 - Live transcript and reply captions that clear automatically
 - Configurable assistant identity, behavior, endpoint, model, and credentials
@@ -18,7 +19,7 @@ The primary interface is a borderless floating orb designed for continuous conve
 
 ```mermaid
 flowchart LR
-    microphone[Microphone] -->|native audio capture| app
+    microphone[Microphone] -->|WebRTC echo-cancelled audio| app
 
     subgraph mac[Your Mac]
         app[Native SwiftUI application]
@@ -41,7 +42,7 @@ flowchart LR
     app -.->|configuration and debug events| engine
 ```
 
-The macOS app manages the interface, native microphone capture, audio playback, settings, and debug workspace. The local engine keeps the MLX speech models warm and fuses recognized speech, semantic pause prediction, and an adaptive room-noise floor to detect the end of a user turn. It then streams text to the configured LLM and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
+The macOS app manages the native interface, settings, and debug workspace. A visually hidden local WebKit surface keeps microphone capture and assistant playback in one WebRTC/WebAudio graph so acoustic echo cancellation has the correct playback reference. The local engine keeps the MLX speech models warm and fuses recognized speech, semantic pause prediction, and an adaptive room-noise floor to detect the end of a user turn. It then streams text to the configured LLM and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
 
 The app and engine exchange JSON state/text events and binary audio frames over a local WebSocket. Engine readiness is exposed through a local HTTP health endpoint.
 

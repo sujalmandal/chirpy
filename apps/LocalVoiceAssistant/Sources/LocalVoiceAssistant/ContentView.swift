@@ -8,7 +8,14 @@ struct ContentView: View {
     @EnvironmentObject private var metrics: SystemMetrics
 
     var body: some View {
-        AssistantView(session: session, engine: engine)
+        ZStack(alignment: .topLeading) {
+            AssistantView(session: session, engine: engine)
+            WebMicrophoneHost(session: session)
+                .frame(width: 1, height: 1)
+                .opacity(0.001)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
         .task {
             engine.startIfNeeded(configuration: settings.engineEnvironment)
             metrics.start(engine: engine)

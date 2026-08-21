@@ -177,6 +177,136 @@ def stream_chat(text: str, session_id: str, config: dict[str, str]):
 _READY = {"stt_ready": False, "tts_ready": False, "config": {}}
 _READY.update({"stt_error": None, "stt_error_count": 0, "stt_last_recovery": None})
 
+MICROPHONE_PAGE = b"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<body style="margin:0;background:transparent;overflow:hidden">
+<script>
+(() => {
+  const bridge = window.webkit?.messageHandlers?.microphoneBridge;
+  let stream, context, source, processor, mute, pending = [];
+  const playbackSources = new Set();
+  let playbackEpoch = 0;
+  let nextPlaybackTime = 0;
+  const targetRate = 24000;
+  const targetBlock = 1920;
+
+  function post(message) { bridge?.postMessage(message); }
+  function encodeBlock(samples) {
+    const floats = new Float32Array(samples);
+    const bytes = new Uint8Array(floats.buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+  }
+  function resample(input, fromRate) {
+    if (fromRate === targetRate) return Array.from(input);
+    const ratio = fromRate / targetRate;
+    const count = Math.floor(input.length / ratio);
+    const output = new Array(count);
+    for (let i = 0; i < count; i++) {
+      const start = Math.floor(i * ratio);
+      const end = Math.max(start + 1, Math.floor((i + 1) * ratio));
+      let sum = 0;
+      for (let j = start; j < Math.min(end, input.length); j++) sum += input[j];
+      output[i] = sum / Math.max(1, Math.min(end, input.length) - start);
+    }
+    return output;
+  }
+  async function stopCapture() {
+    stopPlayback();
+    if (processor) processor.disconnect();
+    if (source) source.disconnect();
+    if (mute) mute.disconnect();
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (context && context.state !== 'closed') await context.close();
+    stream = context = source = processor = mute = null;
+    pending = [];
+  }
+  function decodeBlock(encoded) {
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Float32Array(bytes.buffer);
+  }
+  function playPCM(encoded) {
+    if (!context || context.state === 'closed') return false;
+    const samples = decodeBlock(encoded);
+    const buffer = context.createBuffer(1, samples.length, targetRate);
+    buffer.copyToChannel(samples, 0);
+    const node = context.createBufferSource();
+    const epoch = playbackEpoch;
+    node.buffer = buffer;
+    node.connect(context.destination);
+    nextPlaybackTime = Math.max(nextPlaybackTime, context.currentTime + 0.025);
+    node.start(nextPlaybackTime);
+    nextPlaybackTime += buffer.duration;
+    playbackSources.add(node);
+    node.onended = () => {
+      playbackSources.delete(node);
+      if (epoch === playbackEpoch) post({ type: 'playback_block_done' });
+    };
+    return true;
+  }
+  function stopPlayback() {
+    playbackEpoch++;
+    for (const node of playbackSources) {
+      try { node.stop(); } catch (_) {}
+    }
+    playbackSources.clear();
+    nextPlaybackTime = context ? context.currentTime : 0;
+  }
+  async function startCapture() {
+    try {
+      await stopCapture();
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: { ideal: true },
+          noiseSuppression: { ideal: true },
+          autoGainControl: { ideal: true },
+          channelCount: { ideal: 1 }
+        },
+        video: false
+      });
+      context = new AudioContext({ latencyHint: 'interactive' });
+      await context.resume();
+      source = context.createMediaStreamSource(stream);
+      processor = context.createScriptProcessor(2048, 1, 1);
+      mute = context.createGain();
+      mute.gain.value = 0;
+      processor.onaudioprocess = event => {
+        pending.push(...resample(event.inputBuffer.getChannelData(0), context.sampleRate));
+        while (pending.length >= targetBlock) {
+          const block = pending.splice(0, targetBlock);
+          post({ type: 'audio', pcm: encodeBlock(block) });
+        }
+      };
+      source.connect(processor);
+      processor.connect(mute);
+      mute.connect(context.destination);
+      const settings = stream.getAudioTracks()[0]?.getSettings?.() || {};
+      post({
+        type: 'ready',
+        echoCancellation: settings.echoCancellation === true,
+        noiseSuppression: settings.noiseSuppression === true,
+        autoGainControl: settings.autoGainControl === true,
+        sampleRate: settings.sampleRate || context.sampleRate
+      });
+    } catch (error) {
+      post({ type: 'error', message: `${error.name || 'Error'}: ${error.message || error}` });
+    }
+  }
+  window.startCapture = startCapture;
+  window.stopCapture = stopCapture;
+  window.playPCM = playPCM;
+  window.stopPlayback = stopPlayback;
+  post({ type: 'page_ready' });
+})();
+</script>
+"""
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     server_version = "LocalVoiceAgent/0.2"
@@ -187,6 +317,15 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
+        if self.path.startswith("/microphone"):
+            log("web microphone page served")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(MICROPHONE_PAGE)))
+            self.end_headers()
+            self.wfile.write(MICROPHONE_PAGE)
+            return
         if self.path != "/health":
             self.send_error(404)
             return
@@ -858,6 +997,10 @@ class Agent:
                             "audio input voice_processing="
                             f"{'enabled' if self.aec_enabled else 'unavailable'}"
                         )
+                    elif event.get("type") == "capture_diagnostic":
+                        stage = str(event.get("stage", "unknown"))[:80]
+                        details = str(event.get("details", ""))[:500]
+                        log(f"audio capture stage={stage} details={details}")
                     elif event.get("type") == "playback_done":
                         if self.current_turn_id is not None:
                             log(
