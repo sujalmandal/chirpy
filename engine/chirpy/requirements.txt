@@ -1,0 +1,8 @@
+faster-whisper
+kokoro
+numpy
+onnxruntime==1.29.0
+livekit-agents
+livekit-plugins-silero
+livekit-plugins-openai
+livekit-plugins-dtln
