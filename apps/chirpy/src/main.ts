@@ -441,7 +441,7 @@ function finishLastAssistant() {
 function updateLastUser(text: string, final: boolean) {
   const box = document.getElementById("messages");
   if (!box) return;
-  let last = box.lastElementChild as HTMLElement | null;
+  let last: HTMLElement | null | undefined = box.lastElementChild as HTMLElement | null;
   let m = messages[messages.length - 1];
   if (!last || !last.classList.contains("user") || m?.state !== "streaming") {
     m = { role: "user", text: "", time: now(), state: "streaming" };
