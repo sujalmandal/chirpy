@@ -42,7 +42,7 @@ from moshi_mlx.models.tts import TTSModel, DEFAULT_DSM_TTS_REPO, DEFAULT_DSM_TTS
 from moshi_mlx.utils import Sampler
 from moshi_mlx.utils.loaders import hf_get
 
-from endpointing import BargeInGate, EndpointDetector
+from endpointing import BargeInGate, EndpointDetector, is_probable_playback_echo
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "config" / "local.env"
@@ -568,6 +568,8 @@ class Agent:
         self.barge_echo_multiplier = float(
             config.get("BARGE_IN_ECHO_MULTIPLIER", "4.0")
         )
+        self.barge_energy_confirmed_until = 0.0
+        self.current_reply_text = ""
         self.cancel_flag = False
         self.playback_started = 0.0
         self.last_k_update = 0.0
@@ -649,6 +651,7 @@ class Agent:
         self.epoch += 1
         self.playback_active = False
         self.synthesizing = False
+        self.current_reply_text = ""
         if self.current_turn and not self.current_turn.done():
             self.current_turn.cancel()
         await self.send_event(
@@ -682,8 +685,8 @@ class Agent:
         """Consume mic PCM, detect end-of-turn, and handle barge-in.
 
         During synthesis, mic energy is compared with played audio because STT
-        and TTS share one Metal lane. During the playback tail, native AEC makes
-        it safe to resume STT and recognized words can interrupt immediately.
+        and TTS share one Metal lane. During the playback tail, STT resumes, but
+        recognized words must also pass echo and residual-energy checks.
         """
         stt = Agent.stt
         fragments: list[str] = []
@@ -702,21 +705,19 @@ class Agent:
                     rms = float(np.sqrt(np.mean(samples * samples)))
 
             # --- Barge-in detection while the assistant is playing ----------
-            # If STT already decoded the start of a new user utterance while
-            # the LLM was responding, never let newly-started playback cover it.
-            if self.playback_active and fragments:
-                await self._cancel_current_turn(
-                    "recognized_speech_before_playback", "user", reset_stt=False
-                )
-            if self.playback_active and (self.synthesizing or not self.aec_enabled):
+            if self.playback_active:
                 played = self._played_energy()
                 elapsed = time.time() - self.playback_started
-                # Only arm barge-in while TTS is actively synthesizing. Once
-                # synthesis finishes, the remaining playback is just the drain
-                # of already-buffered audio; its echo tail must not trigger a
-                # false barge-in.
-                if not self.synthesizing:
+                # Text already decoded before playback began represents a real
+                # user continuation, not playback echo.
+                if fragments and elapsed < 0.4:
+                    await self._cancel_current_turn(
+                        "recognized_speech_before_playback", "user", reset_stt=False
+                    )
                     continue
+                # Only arm barge-in while TTS is actively synthesizing. Once
+                # synthesis finishes, STT can run again, but recognized text
+                # must still be backed by independent residual mic energy.
                 # Estimate echo coupling k = mic_rms / played_rms(delayed). The
                 # mic hears the echo ~80 ms AFTER the speaker plays it, so we
                 # divide by the delayed played RMS; using the instantaneous value
@@ -750,18 +751,24 @@ class Agent:
                         threshold,
                         self.coupling_k * echo_reference * self.barge_echo_multiplier,
                     )
-                if self.barge_gate.observe(
+                residual_confirmed = self.barge_gate.observe(
                     elapsed_ms=elapsed * 1000.0, rms=rms, threshold=threshold
-                ):
-                    await self._barge_in(rms=rms, threshold=threshold, played=played)
-                    grace_until = time.time() + 0.3
+                )
+                if residual_confirmed:
+                    self.barge_energy_confirmed_until = time.time() + 1.2
+                    if self.synthesizing or not self.aec_enabled:
+                        await self._barge_in(
+                            rms=rms, threshold=threshold, played=played
+                        )
+                        grace_until = time.time() + 0.3
                 if DEBUG and self.barge_gate.run > 0:
                     debug(
                         f"barge-in: mic={rms:.4f} played={played:.4f} "
                         f"k={self.coupling_k} thr={threshold:.4f} "
                         f"run={self.barge_gate.run}/{self.barge_gate.required_blocks}"
                     )
-                continue
+                if self.synthesizing or not self.aec_enabled:
+                    continue
 
             # --- Grace period after barge-in (let echo tail die) ------------
             if time.time() < grace_until:
@@ -812,11 +819,33 @@ class Agent:
             if fragment:
                 fragments.append(fragment)
                 partial = "".join(fragments).strip()
-                await self.send_event(type="partial", text=partial)
                 if partial and self.playback_active and self.aec_enabled:
-                    await self._cancel_current_turn(
-                        "recognized_speech_barge_in", "user", reset_stt=False
-                    )
+                    if is_probable_playback_echo(partial, self.current_reply_text):
+                        log(
+                            f"turn={self.current_turn_id or '-'} owner=user "
+                            f"state=suppressed reason=playback_echo transcript={partial[:120]!r}"
+                        )
+                        fragments.clear()
+                        await self._mlx(stt.reset)
+                        self.endpoint.reset()
+                        continue
+                    if time.time() <= self.barge_energy_confirmed_until:
+                        await self.send_event(type="partial", text=partial)
+                        await self._cancel_current_turn(
+                            "recognized_speech_barge_in", "user", reset_stt=False
+                        )
+                    else:
+                        log(
+                            f"turn={self.current_turn_id or '-'} owner=user "
+                            "state=suppressed reason=no_residual_energy "
+                            f"transcript={partial[:120]!r}"
+                        )
+                        fragments.clear()
+                        await self._mlx(stt.reset)
+                        self.endpoint.reset()
+                        continue
+                else:
+                    await self.send_event(type="partial", text=partial)
 
             has_text = bool("".join(fragments).strip())
             decision = self.endpoint.observe(
@@ -895,6 +924,8 @@ class Agent:
         self.coupling_k = None
         self.coupling_samples = []
         self.barge_gate.reset()
+        self.barge_energy_confirmed_until = 0.0
+        self.current_reply_text = ""
         self.played_now = 0.0
         self.last_k_update = 0.0
         self.turn_audio_bytes = 0
@@ -921,6 +952,7 @@ class Agent:
             await self.send_event(type="done", turn_id=turn_id, owner="assistant")
             return
         log(f"turn={turn_id} owner=assistant state=reply_ready text_chars={len(reply)}")
+        self.current_reply_text = reply
         self.playback_active = True
         self.synthesizing = True
         self.playback_started = time.time()
@@ -1025,6 +1057,8 @@ class Agent:
                             self.current_turn_id = None
                         self.playback_active = False
                         self.cancel_flag = False
+                        self.current_reply_text = ""
+                        self.barge_energy_confirmed_until = 0.0
                         await self._mlx(Agent.stt.reset)
                         self.endpoint.reset()
         except websockets.ConnectionClosed:

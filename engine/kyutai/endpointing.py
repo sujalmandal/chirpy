@@ -7,8 +7,10 @@ cases reproducible without loading several gigabytes of model weights.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from enum import Enum
 import math
+import re
 
 
 class EndpointState(str, Enum):
@@ -226,3 +228,23 @@ class BargeInGate:
             return False
         self.run = 0
         return True
+
+
+def is_probable_playback_echo(transcript: str, assistant_reply: str) -> bool:
+    """Return whether a partial transcript likely came from current playback."""
+    candidate_words = re.findall(r"[a-z0-9']+", transcript.lower())
+    reply_words = re.findall(r"[a-z0-9']+", assistant_reply.lower())
+    if len(candidate_words) < 2 or len("".join(candidate_words)) < 7:
+        return False
+    candidate = " ".join(candidate_words)
+    reply = " ".join(reply_words)
+    if candidate in reply:
+        return True
+    width = len(candidate_words)
+    if width < 3 or not reply_words:
+        return False
+    for start in range(max(1, len(reply_words) - width + 1)):
+        window = " ".join(reply_words[start:start + width])
+        if SequenceMatcher(None, candidate, window).ratio() >= 0.82:
+            return True
+    return False

@@ -1,6 +1,11 @@
 import unittest
 
-from endpointing import BargeInGate, EndpointDetector, EndpointState
+from endpointing import (
+    BargeInGate,
+    EndpointDetector,
+    EndpointState,
+    is_probable_playback_echo,
+)
 
 
 class EndpointDetectorTests(unittest.TestCase):
@@ -155,6 +160,32 @@ class BargeInGateTests(unittest.TestCase):
         for index in range(12):
             gate.observe(elapsed_ms=index * 80, rms=0.09, threshold=0.05)
         self.assertEqual(gate.run, 0)
+
+
+class PlaybackEchoTests(unittest.TestCase):
+    def test_exact_reply_fragment_is_echo(self):
+        self.assertTrue(is_probable_playback_echo(
+            "If you're curious about",
+            "If you're curious about how it works, I can explain it.",
+        ))
+
+    def test_minor_recognition_error_is_echo(self):
+        self.assertTrue(is_probable_playback_echo(
+            "the quick brown fox jumps",
+            "The quick brown box jumps over the fence.",
+        ))
+
+    def test_unrelated_user_interruption_is_not_echo(self):
+        self.assertFalse(is_probable_playback_echo(
+            "Please stop talking now",
+            "I can continue explaining how the system works.",
+        ))
+
+    def test_short_phrase_is_not_suppressed_by_text_alone(self):
+        self.assertFalse(is_probable_playback_echo(
+            "stop it",
+            "You can stop it from the menu.",
+        ))
 
 
 if __name__ == "__main__":
