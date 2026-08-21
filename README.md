@@ -24,8 +24,8 @@ flowchart LR
     subgraph mac[Your Mac]
         app[Native SwiftUI application]
         engine[Local Python voice engine]
-        stt[Kyutai STT and adaptive semantic VAD]
-        tts[Kyutai streaming TTS]
+        stt[Continuous Kyutai STT and semantic VAD<br/>dedicated MLX CPU process]
+        tts[Kyutai streaming TTS<br/>MLX GPU process]
         output[Audio playback]
 
         app -->|binary WebSocket audio| engine
@@ -42,7 +42,7 @@ flowchart LR
     app -.->|configuration and debug events| engine
 ```
 
-The macOS app manages the native interface, settings, and debug workspace. A visually hidden local WebKit surface keeps microphone capture and assistant playback in one WebRTC/WebAudio graph so acoustic echo cancellation has the correct playback reference. The local engine keeps the MLX speech models warm and fuses recognized speech, semantic pause prediction, and an adaptive room-noise floor to detect the end of a user turn. It then streams text to the configured LLM and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
+The macOS app manages the native interface, settings, and debug workspace. A visually hidden local WebKit surface keeps microphone capture and assistant playback in one WebRTC/WebAudio graph so acoustic echo cancellation has the correct playback reference. Kyutai STT and its semantic VAD stay active in a dedicated MLX CPU process even while the separate GPU process synthesizes speech. A bounded live microphone window prevents slower CPU inference from accumulating seconds of stale audio. The engine fuses recognized speech, semantic pause prediction, playback-aware echo evidence, and an adaptive room-noise floor to manage turns. A confirmed new user turn cancels active generation and playback without unloading either speech model.
 
 The app and engine exchange JSON state/text events and binary audio frames over a local WebSocket. Engine readiness is exposed through a local HTTP health endpoint.
 
@@ -93,7 +93,7 @@ Debug Mode is the operational view for the assistant. It includes:
 
 - A unified user/assistant transcript with timestamps and turn IDs
 - Engine status and local system metrics
-- Explicit VAD endpoint decisions, raw and smoothed pause scores, adaptive thresholds, turn ownership, and cancellation sources
+- Continuous CPU STT/VAD health and step latency, endpoint decisions, raw and smoothed pause scores, adaptive thresholds, turn ownership, and cancellation sources
 - LLM and agent configuration
 
 Log files are written to:

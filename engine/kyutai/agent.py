@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Local voice agent built on Kyutai STT 1B (semantic VAD) + Ollama Cloud LLM
-+ Kyutai TTS 1.6B (MLX).
+"""Local voice agent built on Kyutai STT 1B (semantic VAD) + an
+OpenAI-compatible LLM + Kyutai TTS 1.6B (MLX).
 
-Audio recognition (STT) and speech synthesis (TTS) run locally on MLX. The LLM
-is an OpenAI-compatible cloud endpoint configured in config/local.env. The Swift
-client streams microphone audio over WebSocket and receives streamed text events
-plus decoded 24 kHz Float32 mono PCM frames for playback.
+STT and semantic VAD run continuously in a dedicated MLX CPU process while TTS
+runs on the GPU in the main process. The Swift client streams microphone audio
+over WebSocket and receives streamed text events plus decoded 24 kHz Float32
+mono PCM frames for playback.
 
 Wire protocol:
   client -> agent : binary Float32 LE mono 24 kHz PCM, 1920-sample (80 ms) blocks
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import os
 import threading
 import time
@@ -65,10 +66,10 @@ class TurnCancelled(Exception):
     """Raised inside TTS generation when a barge-in cancels the turn."""
 
 
-# MLX/Metal is not thread-safe: STT and TTS must never run concurrently on
-# different threads. All inference goes through this single-worker executor so
-# there is a total order over Metal operations.
+# TTS owns the main process's MLX/Metal state. STT calls use a separate executor
+# only to wait on IPC from the dedicated CPU worker; they never enter Metal.
 MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+STT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt-ipc")
 
 LOG_PATH = ROOT / "logs" / "kyutai-agent.log"
 LOG_BACKUP_PATH = ROOT / "logs" / "kyutai-agent.log.1"
@@ -343,11 +344,17 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         cfg = _READY["config"]
+        stt = getattr(Agent, "stt", None)
+        stt_alive = bool(stt and stt.is_alive())
         payload = {
             "status": "ok",
             "service": "kyutai-voice-agent",
-            "stt_ready": _READY["stt_ready"],
+            "stt_ready": _READY["stt_ready"] and stt_alive,
             "tts_ready": _READY["tts_ready"],
+            "stt_device": "cpu",
+            "stt_continuous": True,
+            "stt_last_step_ms": round(getattr(stt, "last_step_ms", 0.0), 1),
+            "stt_max_step_ms": round(getattr(stt, "max_step_ms", 0.0), 1),
             "llm_configured": bool(cfg.get("LLM_BASE_URL") and cfg.get("LLM_MODEL_NAME")),
             "agent_name": cfg.get("AGENT_NAME", "Nova"),
             "vad_model": cfg.get("VAD_REPO", cfg.get("STT_REPO", "")),
@@ -372,6 +379,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 class SpeechToText:
     def __init__(self, config: dict[str, str]):
         repo = config.get("STT_REPO", "kyutai/stt-1b-en_fr-candle").strip()
+        quantize = int(config.get("STT_QUANTIZE", "0") or 0)
         log("STT: downloading/loading config")
         cfg_path = hf_get("config.json", repo)
         with open(cfg_path) as fobj:
@@ -385,6 +393,10 @@ class SpeechToText:
         self.lm.set_dtype(mx.bfloat16)
         log("STT: loading LM weights")
         self.lm.load_pytorch_weights(str(moshi_weights), lm_config, strict=True)
+        if quantize:
+            group_size = 32 if quantize == 4 else 64
+            log(f"STT: quantizing CPU model to {quantize} bits")
+            nn.quantize(self.lm, bits=quantize, group_size=group_size)
 
         self.tokenizer = sentencepiece.SentencePieceProcessor(str(tokenizer_name))
         generated_codebooks = lm_config.generated_codebooks
@@ -461,6 +473,126 @@ class SpeechToText:
             vad_prob = extra_heads[2][0, 0, 0].item()
         self.blocks_since_hard_reset += 1
         return fragment, vad_prob
+
+
+def _stt_worker_main(config: dict[str, str], connection) -> None:
+    """Own the Kyutai STT model and all of its streaming state on MLX CPU."""
+    try:
+        mx.set_default_device(mx.cpu)
+        started = time.monotonic()
+        log("STT worker: loading continuously on MLX CPU")
+        worker_config = dict(config)
+        worker_config["STT_QUANTIZE"] = config.get("STT_CPU_QUANTIZE", "0")
+        stt = SpeechToText(worker_config)
+        connection.send(("ready", {"load_seconds": time.monotonic() - started}))
+    except BaseException as error:
+        try:
+            connection.send(("startup_error", repr(error)))
+        finally:
+            connection.close()
+        return
+
+    try:
+        while True:
+            request = connection.recv()
+            operation = request[0]
+            if operation == "close":
+                return
+            try:
+                if operation == "step":
+                    result = stt.step(request[1])
+                elif operation == "reset":
+                    result = stt.reset(bool(request[1]))
+                else:
+                    raise ValueError(f"Unknown STT worker operation: {operation}")
+                connection.send(("ok", result))
+            except BaseException as error:
+                connection.send(("error", repr(error)))
+    except (EOFError, BrokenPipeError):
+        pass
+    finally:
+        connection.close()
+
+
+class SpeechToTextWorker:
+    """Synchronous IPC facade used from the agent's dedicated STT executor."""
+
+    def __init__(self, config: dict[str, str]):
+        self.rotate_blocks = max(500, int(config.get("STT_ROTATE_BLOCKS", "3000")))
+        self.blocks_since_hard_reset = 0
+        self.lock = threading.Lock()
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe()
+        self.connection = parent
+        self.last_step_ms = 0.0
+        self.max_step_ms = 0.0
+        self.process = context.Process(
+            target=_stt_worker_main,
+            args=(config, child),
+            name="kyutai-stt-cpu",
+            daemon=True,
+        )
+        self.process.start()
+        child.close()
+        timeout = float(config.get("STT_CPU_START_TIMEOUT_SECONDS", "180"))
+        if not self.connection.poll(timeout):
+            self.close(force=True)
+            raise RuntimeError(f"CPU STT worker did not become ready within {timeout:.0f}s")
+        try:
+            status, payload = self.connection.recv()
+        except EOFError as error:
+            self.close(force=True)
+            raise RuntimeError("CPU STT worker exited during startup") from error
+        if status != "ready":
+            self.close(force=True)
+            raise RuntimeError(f"CPU STT worker failed to start: {payload}")
+        log(
+            "STT worker ready device=cpu "
+            f"load_seconds={float(payload['load_seconds']):.1f} pid={self.process.pid}"
+        )
+
+    def _request(self, operation: str, payload=None):
+        with self.lock:
+            if not self.process.is_alive():
+                raise RuntimeError("CPU STT worker stopped unexpectedly")
+            self.connection.send((operation, payload))
+            if not self.connection.poll(30.0):
+                raise TimeoutError(f"CPU STT worker timed out during {operation}")
+            status, result = self.connection.recv()
+            if status != "ok":
+                raise RuntimeError(f"CPU STT worker {operation} failed: {result}")
+            return result
+
+    def step(self, pcm_float32: bytes) -> tuple[str | None, float]:
+        started = time.monotonic()
+        result = self._request("step", pcm_float32)
+        self.last_step_ms = (time.monotonic() - started) * 1000.0
+        self.max_step_ms = max(self.max_step_ms, self.last_step_ms)
+        self.blocks_since_hard_reset += 1
+        return result
+
+    def reset(self, hard: bool = False) -> None:
+        self._request("reset", hard)
+        if hard:
+            self.blocks_since_hard_reset = 0
+
+    def should_rotate(self) -> bool:
+        return self.blocks_since_hard_reset >= self.rotate_blocks
+
+    def is_alive(self) -> bool:
+        return self.process.is_alive()
+
+    def close(self, force: bool = False) -> None:
+        try:
+            if not force and self.process.is_alive():
+                self.connection.send(("close", None))
+                self.process.join(timeout=2.0)
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=2.0)
+        self.connection.close()
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +692,14 @@ class Agent:
         self.config = config
         self.ws = websocket
         self.session_id = str(uuid.uuid4())
-        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
+        # CPU STT can occasionally run slower than the 80 ms capture cadence.
+        # Keep only a short live window rather than letting several seconds of
+        # stale audio delay barge-in and end-of-turn decisions.
+        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=max(4, int(config.get("MIC_QUEUE_BLOCKS", "8")))
+        )
+        self.mic_blocks_dropped = 0
+        self.last_mic_drop_log = 0.0
         self.tts_queue: asyncio.Queue = asyncio.Queue()
         self.current_turn: asyncio.Task | None = None
         self.current_turn_id: int | None = None
@@ -586,6 +725,7 @@ class Agent:
         self.barge_energy_confirmed_until = 0.0
         self.current_reply_text = ""
         self.stt_discard_epoch = 0
+        self.continuous_stt_logged = False
         self.cancel_flag = False
         self.playback_started = 0.0
         self.last_k_update = 0.0
@@ -617,13 +757,14 @@ class Agent:
         await self.ws.send(json.dumps(payload))
 
     async def _mlx(self, fn, *args):
-        """Run an MLX/Metal call on the single shared worker thread.
-
-        MLX is not thread-safe, so every inference call must be serialized
-        through one thread to avoid concurrent Metal command-encoder state.
-        """
+        """Run a TTS MLX/Metal call on the main process's serial executor."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(MLX_EXECUTOR, fn, *args)
+
+    async def _stt(self, fn, *args):
+        """Call the continuous CPU STT process without blocking asyncio."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(STT_EXECUTOR, fn, *args)
 
     async def out_writer(self):
         while True:
@@ -678,31 +819,17 @@ class Agent:
             f"audio_seconds={self.turn_audio_seconds:.1f} audio_bytes={self.turn_audio_bytes}"
         )
         if reset_stt:
-            await self._mlx(Agent.stt.reset)
+            await self._stt(Agent.stt.reset)
         self.current_turn_id = None
-
-    async def _barge_in(self, *, rms: float, threshold: float, played: float):
-        """Cancel the assistant because VAD detected user speech over playback."""
-        log(
-            f"turn={self.current_turn_id or '-'} owner=user state=barge_in_detected "
-            f"evidence=sustained_residual_energy mic_rms={rms:.4f} "
-            f"threshold={threshold:.4f} played_rms={played:.4f} "
-            f"coupling={self.coupling_k if self.coupling_k is not None else 'unavailable'} "
-            f"required_ms={self.barge_gate.required_blocks * self.barge_gate.block_ms}"
-        )
-        await self._cancel_current_turn("vad_barge_in", "user", reset_stt=True)
-        debug("barge-in: assistant turn cancelled, STT reset")
 
     async def stt_loop(self):
         """Consume mic PCM, detect end-of-turn, and handle barge-in.
 
-        During synthesis, mic energy is compared with played audio because STT
-        and TTS share one Metal lane. During the playback tail, STT resumes, but
-        recognized words must also pass echo and residual-energy checks.
+        The dedicated CPU worker keeps Kyutai STT and semantic VAD active during
+        GPU TTS. Recognized words still pass echo and residual-energy checks.
         """
         stt = Agent.stt
         fragments: list[str] = []
-        grace_until = 0.0
         discard_epoch = self.stt_discard_epoch
         while True:
             if self.session_id != Agent.active_session_id:
@@ -777,24 +904,12 @@ class Agent:
                 )
                 if residual_confirmed:
                     self.barge_energy_confirmed_until = time.time() + 1.2
-                    if self.synthesizing or not self.aec_enabled:
-                        await self._barge_in(
-                            rms=rms, threshold=threshold, played=played
-                        )
-                        grace_until = time.time() + 0.3
                 if DEBUG and self.barge_gate.run > 0:
                     debug(
                         f"barge-in: mic={rms:.4f} played={played:.4f} "
                         f"k={self.coupling_k} thr={threshold:.4f} "
                         f"run={self.barge_gate.run}/{self.barge_gate.required_blocks}"
                     )
-                if self.synthesizing or not self.aec_enabled:
-                    continue
-
-            # --- Grace period after barge-in (let echo tail die) ------------
-            if time.time() < grace_until:
-                continue
-
             if DEBUG and time.time() - self.last_rms_log >= 1.0:
                 self.last_rms_log = time.time()
                 debug(
@@ -806,7 +921,14 @@ class Agent:
                 )
 
             try:
-                fragment, vad_probability = await self._mlx(stt.step, pcm)
+                fragment, vad_probability = await self._stt(stt.step, pcm)
+                if self.synthesizing and not self.continuous_stt_logged:
+                    self.continuous_stt_logged = True
+                    log(
+                        f"turn={self.current_turn_id or '-'} owner=engine "
+                        "state=continuous_stt_during_tts "
+                        f"step_ms={stt.last_step_ms:.1f}"
+                    )
             except Exception as error:
                 self.stt_error_streak += 1
                 _READY["stt_ready"] = False
@@ -821,7 +943,7 @@ class Agent:
                 else:
                     self.stt_suppressed_errors += 1
                 try:
-                    await self._mlx(stt.reset, True)
+                    await self._stt(stt.reset, True)
                     _READY["stt_last_recovery"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 except Exception as reset_error:
                     _READY["stt_error"] = f"Recovery failed: {reset_error}"
@@ -847,11 +969,12 @@ class Agent:
                             f"state=suppressed reason=playback_echo transcript={partial[:120]!r}"
                         )
                         fragments.clear()
-                        await self._mlx(stt.reset)
+                        await self._stt(stt.reset)
                         self.endpoint.reset()
                         continue
                     residual_confirmed = (
-                        time.time() <= self.barge_energy_confirmed_until
+                        not self.playback_reference_logged
+                        or time.time() <= self.barge_energy_confirmed_until
                     )
                     if recognized_barge_in_ready(
                         partial, residual_confirmed=residual_confirmed
@@ -896,11 +1019,11 @@ class Agent:
             # "narrow invalid args" overflow that would otherwise stall listening
             # after ~11 minutes.
             if stt.should_rotate() and not fragments:
-                await self._mlx(stt.reset, True)
+                await self._stt(stt.reset, True)
                 log("STT context rotated before positional limit")
                 self.endpoint.reset()
             elif self.endpoint.blocks_seen >= 120 and not fragments:
-                await self._mlx(stt.reset)
+                await self._stt(stt.reset)
                 self.endpoint.reset()
             if decision:
                 transcript = await self._finalize(stt, fragments)
@@ -941,10 +1064,10 @@ class Agent:
     async def _finalize(self, stt, fragments: list[str]) -> str:
         """Feed trailing silence to flush the delayed STT output, then reset."""
         for _ in range(FLUSH_BLOCKS):
-            fragment, _ = await self._mlx(stt.step, _SILENCE)
+            fragment, _ = await self._stt(stt.step, _SILENCE)
             if fragment:
                 fragments.append(fragment)
-        await self._mlx(stt.reset)
+        await self._stt(stt.reset)
         return "".join(fragments).strip()
 
     async def run_turn(self, transcript: str, turn_id: int, endpoint_reason: str):
@@ -956,6 +1079,7 @@ class Agent:
         self.barge_gate.reset()
         self.barge_energy_confirmed_until = 0.0
         self.current_reply_text = ""
+        self.continuous_stt_logged = False
         self.played_now = 0.0
         self.played_rms.clear()
         self.last_playback_reference_at = 0.0
@@ -1052,6 +1176,17 @@ class Agent:
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
+        # The STT model is a single stateful stream. Reject a second client
+        # instead of silently superseding the live app: superseding used to
+        # leave the first WebSocket open with a stopped STT loop, so its UI
+        # still showed microphone activity while the engine ignored it.
+        if Agent.active_session_id is not None:
+            log(
+                "session rejected reason=voice_session_already_active "
+                f"active_session={Agent.active_session_id}"
+            )
+            await self.ws.close(code=1013, reason="A voice session is already active")
+            return
         Agent.active_session_id = self.session_id
         stt_task = asyncio.create_task(self.stt_loop())
         writer_task = asyncio.create_task(self.out_writer())
@@ -1062,6 +1197,15 @@ class Agent:
                         continue
                     if self.mic_queue.full():
                         self.mic_queue.get_nowait()
+                        self.mic_blocks_dropped += 1
+                        now = time.time()
+                        if now - self.last_mic_drop_log >= 300.0:
+                            log(
+                                "owner=engine state=mic_backlog_trimmed "
+                                f"dropped_blocks={self.mic_blocks_dropped} "
+                                f"queue_blocks={self.mic_queue.maxsize}"
+                            )
+                            self.last_mic_drop_log = now
                     self.mic_queue.put_nowait(message)
                 else:
                     try:
@@ -1108,7 +1252,7 @@ class Agent:
                         self.current_reply_text = ""
                         self.barge_energy_confirmed_until = 0.0
                         self.stt_discard_epoch += 1
-                        await self._mlx(Agent.stt.reset)
+                        await self._stt(Agent.stt.reset)
                         self.endpoint.reset()
         except websockets.ConnectionClosed:
             pass
@@ -1146,24 +1290,30 @@ def main():
     stt_repo = config.get("STT_REPO", "kyutai/stt-1b-en_fr-candle").strip()
     if vad_repo and vad_repo != stt_repo:
         log(f"VAD model {vad_repo!r} selected; using the semantic VAD head bundled with {stt_repo!r} until a matching adapter is installed")
-    Agent.stt = SpeechToText(config)
+    stt_worker = SpeechToTextWorker(config)
+    Agent.stt = stt_worker
     _READY["stt_ready"] = True
-    log("STT ready")
-    Agent.tts = TextToSpeech(config)
-    _READY["tts_ready"] = True
-    log("TTS ready")
+    log("STT ready (continuous CPU worker)")
+    try:
+        mx.set_default_device(mx.gpu)
+        Agent.tts = TextToSpeech(config)
+        _READY["tts_ready"] = True
+        log("TTS ready (MLX GPU)")
 
-    threading.Thread(
-        target=lambda: ThreadingHTTPServer(("127.0.0.1", port), HealthHandler).serve_forever(),
-        daemon=True,
-    ).start()
-    log(f"Health on http://127.0.0.1:{port}/health · WebSocket on ws://127.0.0.1:{ws_port}")
+        threading.Thread(
+            target=lambda: ThreadingHTTPServer(("127.0.0.1", port), HealthHandler).serve_forever(),
+            daemon=True,
+        ).start()
+        log(f"Health on http://127.0.0.1:{port}/health · WebSocket on ws://127.0.0.1:{ws_port}")
 
-    async def serve():
-        async with websockets.serve(lambda ws: Agent(config, ws).run(), "127.0.0.1", ws_port):
-            await asyncio.Future()
+        async def serve():
+            async with websockets.serve(lambda ws: Agent(config, ws).run(), "127.0.0.1", ws_port):
+                await asyncio.Future()
 
-    asyncio.run(serve())
+        asyncio.run(serve())
+    finally:
+        _READY["stt_ready"] = False
+        stt_worker.close()
 
 
 if __name__ == "__main__":
