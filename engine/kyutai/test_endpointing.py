@@ -192,24 +192,24 @@ class PlaybackEchoTests(unittest.TestCase):
 
     def test_unrelated_user_interruption_is_not_echo(self):
         self.assertFalse(is_probable_playback_echo(
-            "Please stop talking now",
+            "Please change the subject now",
             "I can continue explaining how the system works.",
         ))
 
     def test_short_phrase_is_not_suppressed_by_text_alone(self):
         self.assertFalse(is_probable_playback_echo(
-            "stop it",
-            "You can stop it from the menu.",
+            "hold on",
+            "You can hold on from the menu.",
         ))
 
     def test_residual_energy_allows_short_command(self):
         self.assertTrue(recognized_barge_in_ready(
-            "stop", residual_confirmed=True
+            "hello", residual_confirmed=True
         ))
 
     def test_multiword_speech_still_requires_acoustic_confirmation(self):
         self.assertFalse(recognized_barge_in_ready(
-            "please stop talking", residual_confirmed=False
+            "please change direction", residual_confirmed=False
         ))
 
     def test_single_unconfirmed_token_is_not_enough(self):
