@@ -42,6 +42,8 @@ from moshi_mlx.models.tts import TTSModel, DEFAULT_DSM_TTS_REPO, DEFAULT_DSM_TTS
 from moshi_mlx.utils import Sampler
 from moshi_mlx.utils.loaders import hf_get
 
+from endpointing import EndpointDetector
+
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "config" / "local.env"
 
@@ -424,15 +426,23 @@ class Agent:
         self.playback_started = 0.0
         self.last_k_update = 0.0
         self.last_rms_log = 0.0
+        self.last_vad_state = None
+        self.aec_enabled = False
         # Audio/text accounting (per turn + per session).
         self.turn_audio_bytes = 0
         self.turn_audio_seconds = 0.0
         self.session_audio_seconds = 0.0
         self.session_text_chars = 0
-        self.energy_threshold = max(0.0001, float(config.get("VAD_THRESHOLD", "0.01")))
-        self.min_speech_blocks = max(1, round(float(config.get("VAD_MIN_SPEECH_MS", "320")) / 80))
-        self.min_silence_blocks = max(1, round(float(config.get("VAD_MIN_SILENCE_MS", "320")) / 80))
-        self.semantic_threshold = min(1.0, max(0.0, float(config.get("VAD_SEMANTIC_THRESHOLD", "0.6"))))
+        self.endpoint = EndpointDetector(
+            base_energy_threshold=float(config.get("VAD_THRESHOLD", "0.01")),
+            min_speech_ms=int(config.get("VAD_MIN_SPEECH_MS", "320")),
+            min_silence_ms=int(config.get("VAD_MIN_SILENCE_MS", "320")),
+            semantic_end_threshold=float(config.get("VAD_SEMANTIC_THRESHOLD", "0.6")),
+            semantic_speech_threshold=float(config.get("VAD_SEMANTIC_SPEECH_THRESHOLD", "0.4")),
+            warmup_blocks=int(config.get("VAD_WARMUP_BLOCKS", "12")),
+            semantic_hold_blocks=int(config.get("VAD_SEMANTIC_HOLD_BLOCKS", "2")),
+            noise_multiplier=float(config.get("VAD_NOISE_MULTIPLIER", "3.0")),
+        )
         self.stt_error_streak = 0
         self.stt_suppressed_errors = 0
         self.stt_last_error_log = 0.0
@@ -518,15 +528,12 @@ class Agent:
     async def stt_loop(self):
         """Consume mic PCM, detect end-of-turn, and handle barge-in.
 
-        While the assistant is playing, mic audio is not transcribed; instead it
-        is compared against the played audio to detect the user talking over the
-        assistant (barge-in). When idle, energy + hangover detects end-of-turn.
+        During synthesis, mic energy is compared with played audio because STT
+        and TTS share one Metal lane. During the playback tail, native AEC makes
+        it safe to resume STT and recognized words can interrupt immediately.
         """
         stt = Agent.stt
         fragments: list[str] = []
-        speech_run = 0
-        silence_run = 0
-        semantic_pause_run = 0
         grace_until = 0.0
         while True:
             if self.session_id != Agent.active_session_id:
@@ -542,7 +549,13 @@ class Agent:
                     rms = float(np.sqrt(np.mean(samples * samples)))
 
             # --- Barge-in detection while the assistant is playing ----------
-            if self.playback_active:
+            # If STT already decoded the start of a new user utterance while
+            # the LLM was responding, never let newly-started playback cover it.
+            if self.playback_active and fragments:
+                await self._cancel_current_turn(
+                    "recognized_speech_before_playback", "user", reset_stt=False
+                )
+            if self.playback_active and (self.synthesizing or not self.aec_enabled):
                 played = self._played_energy()
                 elapsed = time.time() - self.playback_started
                 # Only arm barge-in while TTS is actively synthesizing. Once
@@ -601,7 +614,13 @@ class Agent:
 
             if DEBUG and time.time() - self.last_rms_log >= 1.0:
                 self.last_rms_log = time.time()
-                debug(f"stt: idle rms={rms:.4f} speech_run={speech_run} silence_run={silence_run} fragments={len(fragments)}")
+                debug(
+                    f"vad: state={self.endpoint.state.value} rms={rms:.4f} "
+                    f"noise_floor={self.endpoint.noise_floor:.4f} "
+                    f"energy_threshold={self.endpoint.energy_threshold:.4f} "
+                    f"silence_run={self.endpoint.silence_run} fragments={len(fragments)} "
+                    f"aec={self.aec_enabled} playback={self.playback_active}"
+                )
 
             try:
                 fragment, vad_probability = await self._mlx(stt.step, pcm)
@@ -626,9 +645,7 @@ class Agent:
                     log(f"STT hard recovery failed: {reset_error}")
                     await asyncio.sleep(1.0)
                 fragments.clear()
-                speech_run = 0
-                silence_run = 0
-                semantic_pause_run = 0
+                self.endpoint.reset()
                 continue
             if self.stt_error_streak:
                 log(f"STT recovered after {self.stt_error_streak} failed block(s)")
@@ -641,16 +658,24 @@ class Agent:
                 fragments.append(fragment)
                 partial = "".join(fragments).strip()
                 await self.send_event(type="partial", text=partial)
-            # Energy gate: track consecutive blocks above/below the speech level.
-            if rms >= self.energy_threshold:
-                speech_run += 1
-                silence_run = 0
-            else:
-                silence_run += 1
-            if speech_run >= self.min_speech_blocks and vad_probability >= self.semantic_threshold:
-                semantic_pause_run += 1
-            else:
-                semantic_pause_run = 0
+                if partial and self.playback_active and self.aec_enabled:
+                    await self._cancel_current_turn(
+                        "recognized_speech_barge_in", "user", reset_stt=False
+                    )
+
+            has_text = bool("".join(fragments).strip())
+            decision = self.endpoint.observe(
+                rms=rms,
+                semantic_probability=vad_probability,
+                has_recognized_text=has_text,
+            )
+            if self.endpoint.state != self.last_vad_state:
+                debug(
+                    f"vad: transition={self.last_vad_state or '-'}->{self.endpoint.state.value} "
+                    f"text_armed={self.endpoint.armed} rms={rms:.4f} "
+                    f"raw={vad_probability:.3f} smooth={self.endpoint.smoothed_probability:.3f}"
+                )
+                self.last_vad_state = self.endpoint.state
             # The STT LmGen has a finite step window (~8192 blocks); it steps on
             # idle silence too, so reset it during long silences to avoid the
             # "narrow invalid args" overflow that would otherwise stall listening
@@ -658,31 +683,24 @@ class Agent:
             if stt.should_rotate() and not fragments:
                 await self._mlx(stt.reset, True)
                 log("STT context rotated before positional limit")
-                speech_run = 0
-                silence_run = 0
-            elif silence_run >= 120 and not fragments:
+                self.endpoint.reset()
+            elif self.endpoint.blocks_seen >= 120 and not fragments:
                 await self._mlx(stt.reset)
-                speech_run = 0
-                silence_run = 0
-            semantic_end = semantic_pause_run >= 2 and silence_run >= 1
-            energy_end = speech_run >= self.min_speech_blocks and silence_run >= self.min_silence_blocks
-            if semantic_end or energy_end:
-                endpoint_reason = "semantic_vad" if semantic_end else "silence_timeout"
-                endpoint_speech_ms = speech_run * 80
-                endpoint_silence_ms = silence_run * 80
-                endpoint_probability = vad_probability
+                self.endpoint.reset()
+            if decision:
                 transcript = await self._finalize(stt, fragments)
                 fragments = []
-                speech_run = 0
-                silence_run = 0
-                semantic_pause_run = 0
+                self.endpoint.reset()
                 while not self.mic_queue.empty():
                     self.mic_queue.get_nowait()
                 if not transcript:
                     log(
                         "turn=- owner=user state=discarded reason=empty_transcript "
-                        f"endpoint={endpoint_reason} speech_ms={endpoint_speech_ms} "
-                        f"silence_ms={endpoint_silence_ms} vad_probability={endpoint_probability:.3f}"
+                        f"endpoint={decision.reason} speech_ms={decision.speech_ms} "
+                        f"silence_ms={decision.silence_ms} "
+                        f"vad_raw={decision.semantic_probability:.3f} "
+                        f"vad_smooth={decision.smoothed_probability:.3f} "
+                        f"energy_threshold={decision.energy_threshold:.4f}"
                     )
                     continue
                 # If a turn is still running (e.g. LLM still streaming), cancel
@@ -693,12 +711,14 @@ class Agent:
                 turn_id = Agent.next_turn_id
                 self.current_turn_id = turn_id
                 log(
-                    f"turn={turn_id} owner=user state=completed endpoint={endpoint_reason} "
-                    f"speech_ms={endpoint_speech_ms} silence_ms={endpoint_silence_ms} "
-                    f"vad_probability={endpoint_probability:.3f} transcript={transcript!r}"
+                    f"turn={turn_id} owner=user state=completed endpoint={decision.reason} "
+                    f"speech_ms={decision.speech_ms} silence_ms={decision.silence_ms} "
+                    f"vad_raw={decision.semantic_probability:.3f} "
+                    f"vad_smooth={decision.smoothed_probability:.3f} "
+                    f"energy_threshold={decision.energy_threshold:.4f} transcript={transcript!r}"
                 )
                 self.current_turn = asyncio.create_task(
-                    self.run_turn(transcript, turn_id, endpoint_reason)
+                    self.run_turn(transcript, turn_id, decision.reason)
                 )
 
     async def _finalize(self, stt, fragments: list[str]) -> str:
@@ -827,6 +847,13 @@ class Agent:
                         continue
                     if event.get("type") == "interrupt":
                         await self._cancel_current_turn("manual_interrupt", "user", reset_stt=True)
+                        self.endpoint.reset()
+                    elif event.get("type") == "audio_processing":
+                        self.aec_enabled = bool(event.get("voice_processing"))
+                        log(
+                            "audio input voice_processing="
+                            f"{'enabled' if self.aec_enabled else 'unavailable'}"
+                        )
                     elif event.get("type") == "playback_done":
                         if self.current_turn_id is not None:
                             log(
@@ -837,6 +864,7 @@ class Agent:
                         self.playback_active = False
                         self.cancel_flag = False
                         await self._mlx(Agent.stt.reset)
+                        self.endpoint.reset()
         except websockets.ConnectionClosed:
             pass
         finally:

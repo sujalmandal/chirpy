@@ -45,9 +45,12 @@ final class KyutaiSession: NSObject, ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var reconnectAttempt = 0
     private var tapInstalled = false
+    private var voiceProcessingEnabled = false
+    private var voiceProcessingWatchdog: Task<Void, Never>?
 
     private let pcmLock = NSLock()
     private var pcmBuffer = Data()
+    private var inputFrameSeen = false
     private var sendTask: Task<Void, Never>?
     private var pendingBuffers = 0
     private var turnDone = false
@@ -81,15 +84,28 @@ final class KyutaiSession: NSObject, ObservableObject {
         status = "Microphone permission denied — allow it in System Settings > Privacy & Security > Microphone, then restart."
     }
 
-    private func beginListening() {
+    private func beginListening(enableVoiceProcessing: Bool = true) {
         let input = audioEngine.inputNode
         do {
-            // Note: setVoiceProcessingEnabled(true) (echo cancellation) leaves
-            // the tap silent on this Mac, so it stays off. The agent discards
-            // mic audio while the assistant is speaking, which prevents the
-            // echo loop instead.
+            // Voice processing gives the endpoint detector an echo-cancelled
+            // microphone stream. It must be configured while the engine is
+            // stopped and before the tap is installed.
+            if enableVoiceProcessing {
+                do {
+                    try input.setVoiceProcessingEnabled(true)
+                    voiceProcessingEnabled = input.isVoiceProcessingEnabled
+                } catch {
+                    voiceProcessingEnabled = false
+                }
+            } else {
+                if input.isVoiceProcessingEnabled {
+                    try? input.setVoiceProcessingEnabled(false)
+                }
+                voiceProcessingEnabled = false
+            }
             let format = input.inputFormat(forBus: 0)
             converter = AVAudioConverter(from: format, to: recordingFormat)
+            pcmLock.withLock { inputFrameSeen = false }
             input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 100), format: format) { [weak self] buffer, _ in
                 guard let self else { return }
                 var level: Float = 0
@@ -101,6 +117,7 @@ final class KyutaiSession: NSObject, ObservableObject {
                 // Convert on the render thread (realtime-safe) and enqueue.
                 if let data = self.convert(buffer) {
                     self.pcmLock.lock()
+                    self.inputFrameSeen = true
                     self.pcmBuffer.append(data)
                     self.pcmLock.unlock()
                 }
@@ -112,6 +129,7 @@ final class KyutaiSession: NSObject, ObservableObject {
             isListening = true; status = "Listening — speak naturally"
             connect()
             startSending()
+            startVoiceProcessingWatchdogIfNeeded()
         } catch {
             let permission = AVCaptureDevice.authorizationStatus(for: .audio)
             if permission == .denied || permission == .restricted {
@@ -124,6 +142,7 @@ final class KyutaiSession: NSObject, ObservableObject {
 
     func stop() {
         sendTask?.cancel(); sendTask = nil
+        voiceProcessingWatchdog?.cancel(); voiceProcessingWatchdog = nil
         reconnectTask?.cancel(); reconnectTask = nil
         disconnect()
         if tapInstalled {
@@ -137,6 +156,36 @@ final class KyutaiSession: NSObject, ObservableObject {
         reconnectAttempt = 0
         micLevel = 0; speakerLevel = 0
         isListening = false; isSpeaking = false; status = "Conversation stopped"
+    }
+
+    private func startVoiceProcessingWatchdogIfNeeded() {
+        voiceProcessingWatchdog?.cancel()
+        guard voiceProcessingEnabled else { return }
+        voiceProcessingWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self, !Task.isCancelled else { return }
+            let receivedInput = self.pcmLock.withLock { self.inputFrameSeen }
+            guard !receivedInput else { return }
+            self.restartWithoutVoiceProcessing()
+        }
+    }
+
+    private func restartWithoutVoiceProcessing() {
+        status = "Retrying microphone without echo cancellation…"
+        voiceProcessingWatchdog?.cancel(); voiceProcessingWatchdog = nil
+        sendTask?.cancel(); sendTask = nil
+        reconnectTask?.cancel(); reconnectTask = nil
+        disconnect()
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        audioEngine.stop()
+        player.stop()
+        pcmLock.withLock { pcmBuffer.removeAll(keepingCapacity: true) }
+        pendingBuffers = 0
+        isListening = false
+        beginListening(enableVoiceProcessing: false)
     }
 
     func interrupt() {
@@ -205,6 +254,10 @@ final class KyutaiSession: NSObject, ObservableObject {
         let task = URLSession.shared.webSocketTask(with: wsURL)
         socket = task
         task.resume()
+        sendJSON([
+            "type": "audio_processing",
+            "voice_processing": voiceProcessingEnabled,
+        ])
         status = reconnectAttempt == 0 ? "Connecting to local voice engine…" : "Reconnecting…"
         receive()
     }

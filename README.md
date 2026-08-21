@@ -6,7 +6,7 @@ The primary interface is a borderless floating orb designed for continuous conve
 
 ## Highlights
 
-- Local speech recognition, voice activity detection, and speech synthesis on Apple Silicon
+- Local speech recognition, adaptive semantic turn detection, and speech synthesis on Apple Silicon
 - Streaming conversation with interruption support: speak while the assistant is responding to take the floor
 - Floating, borderless voice interface with distinct connecting, listening, idle, and speaking states
 - Live transcript and reply captions that clear automatically
@@ -18,12 +18,12 @@ The primary interface is a borderless floating orb designed for continuous conve
 
 ```mermaid
 flowchart LR
-    microphone[Microphone] -->|24 kHz Float32 PCM| app
+    microphone[Microphone] -->|native echo-cancelled audio| app
 
     subgraph mac[Your Mac]
         app[Native SwiftUI application]
         engine[Local Python voice engine]
-        stt[Kyutai STT and semantic VAD]
+        stt[Kyutai STT and adaptive semantic VAD]
         tts[Kyutai streaming TTS]
         output[Audio playback]
 
@@ -41,7 +41,7 @@ flowchart LR
     app -.->|configuration and debug events| engine
 ```
 
-The macOS app manages the interface, microphone capture, audio playback, settings, and debug workspace. The local engine keeps the MLX speech models warm, detects the end of a user turn, streams the resulting text to the configured LLM, and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
+The macOS app manages the interface, echo-cancelled microphone capture, audio playback, settings, and debug workspace. The local engine keeps the MLX speech models warm and fuses recognized speech, semantic pause prediction, and an adaptive room-noise floor to detect the end of a user turn. It then streams text to the configured LLM and synthesizes the reply. A new user turn cancels active generation and playback without unloading the speech models.
 
 The app and engine exchange JSON state/text events and binary audio frames over a local WebSocket. Engine readiness is exposed through a local HTTP health endpoint.
 
@@ -92,7 +92,7 @@ Debug Mode is the operational view for the assistant. It includes:
 
 - A unified user/assistant transcript with timestamps and turn IDs
 - Engine status and local system metrics
-- Explicit VAD endpoint decisions, turn ownership, and cancellation sources
+- Explicit VAD endpoint decisions, raw and smoothed pause scores, adaptive thresholds, turn ownership, and cancellation sources
 - LLM and agent configuration
 
 Log files are written to:
