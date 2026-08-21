@@ -15,11 +15,11 @@ struct LocalMoshiApp: App {
                 .environmentObject(settings)
                 .environmentObject(session)
                 .environmentObject(metrics)
-                .frame(width: 280, height: 270)
+                .frame(width: 300, height: 330)
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
-        .defaultSize(width: 280, height: 270)
+        .defaultSize(width: 300, height: 330)
 
         Window("Voice Assistant Debug", id: "debug") {
             DebugDashboardView(session: session, engine: engine, metrics: metrics)

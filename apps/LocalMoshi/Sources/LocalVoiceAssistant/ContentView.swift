@@ -27,31 +27,56 @@ private struct AssistantView: View {
     @ObservedObject var engine: KyutaiEngine
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.openWindow) private var openWindow
+    @State private var displayedTranscript = ""
+    @State private var displayedReply = ""
+    @State private var transcriptVisible = false
+    @State private var replyVisible = false
+    @State private var transcriptFadeTask: Task<Void, Never>?
+    @State private var replyFadeTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 10) {
             VoiceOrb(
                 micLevel: session.micLevel,
                 speakerLevel: session.speakerLevel,
-                active: session.isListening || session.isSpeaking
+                isListening: session.isListening,
+                isSpeaking: session.isSpeaking
             )
-            .frame(width: 124, height: 124)
+            .frame(width: 132, height: 132)
             controls
-            if !session.transcript.isEmpty {
-                Text(session.transcript)
-                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.94))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .frame(maxWidth: 250, minHeight: 36, alignment: .top)
-                    .shadow(color: .black.opacity(0.9), radius: 4, y: 1)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+            VStack(spacing: 7) {
+                if !displayedTranscript.isEmpty {
+                    floatingCaption(
+                        displayedTranscript,
+                        icon: "waveform",
+                        color: Color(red: 0.55, green: 0.95, blue: 1.0)
+                    )
+                    .opacity(transcriptVisible ? 1 : 0)
+                }
+                if !displayedReply.isEmpty {
+                    floatingCaption(
+                        displayedReply,
+                        icon: "sparkles",
+                        color: Color(red: 0.78, green: 0.72, blue: 1.0)
+                    )
+                    .opacity(replyVisible ? 1 : 0)
+                }
             }
+            .frame(maxWidth: 270, minHeight: 72, alignment: .top)
         }
-        .animation(.easeOut(duration: 0.18), value: session.transcript)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
         .contentShape(Rectangle())
+        .onChange(of: session.transcript) { _, text in
+            showTemporary(text, isReply: false)
+        }
+        .onChange(of: session.reply) { _, text in
+            showTemporary(text, isReply: true)
+        }
+        .onDisappear {
+            transcriptFadeTask?.cancel()
+            replyFadeTask?.cancel()
+        }
         .contextMenu {
             Button {
                 openWindow(id: "debug")
@@ -94,6 +119,55 @@ private struct AssistantView: View {
         .help(help)
     }
 
+    private func floatingCaption(_ text: String, icon: String, color: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(color)
+            Text(text)
+                .font(.system(size: 14, weight: .medium, design: .rounded))
+                .foregroundStyle(.white.opacity(0.96))
+                .multilineTextAlignment(.leading)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: 260, alignment: .center)
+        .shadow(color: .black.opacity(0.92), radius: 4, y: 1)
+        .transition(.opacity.combined(with: .scale(scale: 0.97)))
+    }
+
+    private func showTemporary(_ text: String, isReply: Bool) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if isReply {
+            displayedReply = trimmed
+            replyFadeTask?.cancel()
+            withAnimation(.easeOut(duration: 0.16)) { replyVisible = true }
+            replyFadeTask = fadeTask {
+                withAnimation(.easeInOut(duration: 0.55)) { replyVisible = false }
+                try? await Task.sleep(for: .milliseconds(600))
+                if !Task.isCancelled { displayedReply = "" }
+            }
+        } else {
+            displayedTranscript = trimmed
+            transcriptFadeTask?.cancel()
+            withAnimation(.easeOut(duration: 0.16)) { transcriptVisible = true }
+            transcriptFadeTask = fadeTask {
+                withAnimation(.easeInOut(duration: 0.55)) { transcriptVisible = false }
+                try? await Task.sleep(for: .milliseconds(600))
+                if !Task.isCancelled { displayedTranscript = "" }
+            }
+        }
+    }
+
+    private func fadeTask(_ completion: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            await completion()
+        }
+    }
+
     private var primaryStatus: String {
         if !engine.isReady { return "Getting ready" }
         if session.isSpeaking { return "\(settings.agentName) is speaking" }
@@ -106,53 +180,108 @@ private struct AssistantView: View {
 private struct VoiceOrb: View {
     let micLevel: Float
     let speakerLevel: Float
-    let active: Bool
+    let isListening: Bool
+    let isSpeaking: Bool
 
     var body: some View {
         GeometryReader { geometry in
             TimelineView(.animation(minimumInterval: 1 / 30)) { timeline in
                 let time = timeline.date.timeIntervalSinceReferenceDate
-                let level = CGFloat(min(max(micLevel * 7 + speakerLevel * 3, 0), 1))
+                let input = CGFloat(min(max(micLevel * 8, 0), 1))
+                let output = CGFloat(min(max(speakerLevel * 4, 0), 1))
+                let level = isSpeaking ? max(0.14, output) : (isListening ? input : 0)
                 let size = min(geometry.size.width, geometry.size.height)
+                let blob = AudioBlobShape(
+                    phase: time * (isSpeaking ? 3.4 : 1.45),
+                    amplitude: isSpeaking ? 0.055 + level * 0.105 : 0.018 + level * 0.045
+                )
                 ZStack {
-                    Circle()
-                        .fill(Color.indigo.opacity(0.30))
-                        .frame(width: size * 0.78, height: size * 0.78)
-                        .blur(radius: size * 0.13)
-                        .scaleEffect(active ? 1.0 + level * 0.12 : 0.92)
-                    ForEach(0..<4, id: \.self) { index in
-                        let phase = time * (0.72 + Double(index) * 0.08) + Double(index)
-                        Circle()
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color(red: 0.92, green: 0.95, blue: 1.0).opacity(0.92),
-                                        Color(red: 0.48, green: 0.57, blue: 1.0).opacity(0.72),
-                                        Color(red: 0.70, green: 0.88, blue: 1.0).opacity(0.76),
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
+                    blob
+                        .fill(orbGradient)
+                        .shadow(color: glowColor.opacity(isSpeaking ? 0.44 : 0.26), radius: isSpeaking ? 8 : 5)
+                    blob
+                        .fill(
+                            RadialGradient(
+                                colors: [.white.opacity(0.58), .white.opacity(0.10), .clear],
+                                center: UnitPoint(x: 0.34, y: 0.25),
+                                startRadius: 0,
+                                endRadius: size * 0.46
                             )
-                            .frame(width: size * (0.55 + CGFloat(index) * 0.025), height: size * (0.55 + CGFloat(index) * 0.018))
-                            .blur(radius: size * (0.025 + CGFloat(index) * 0.012))
-                            .offset(
-                                x: CGFloat(sin(phase)) * size * 0.025 * (1 + level),
-                                y: CGFloat(cos(phase * 0.83)) * size * 0.022 * (1 + level)
-                            )
-                            .scaleEffect(1 + level * (0.04 + CGFloat(index) * 0.012))
-                            .blendMode(.screen)
-                    }
-                    Circle()
-                        .fill(.white.opacity(0.12))
-                        .frame(width: size * 0.51, height: size * 0.51)
-                        .overlay(Circle().stroke(.white.opacity(0.22), lineWidth: 0.7))
+                        )
+                    blob
+                        .stroke(.white.opacity(0.52), lineWidth: 1.15)
                 }
+                .padding(size * 0.10)
+                .scaleEffect(1 + level * 0.035)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(active ? "Voice activity" : "Assistant idle")
+        .accessibilityLabel(isSpeaking ? "Assistant speaking" : (isListening ? "Listening" : "Assistant idle"))
+    }
+
+    private var glowColor: Color {
+        if isSpeaking { return Color(red: 0.54, green: 0.30, blue: 1.0) }
+        if isListening { return Color(red: 0.10, green: 0.86, blue: 0.92) }
+        return Color(red: 0.32, green: 0.42, blue: 0.95)
+    }
+
+    private var orbGradient: LinearGradient {
+        let colors: [Color]
+        if isSpeaking {
+            colors = [
+                Color(red: 0.92, green: 0.48, blue: 1.0),
+                Color(red: 0.42, green: 0.30, blue: 0.98),
+                Color(red: 0.18, green: 0.48, blue: 0.98),
+            ]
+        } else if isListening {
+            colors = [
+                Color(red: 0.42, green: 1.0, blue: 0.92),
+                Color(red: 0.08, green: 0.72, blue: 0.92),
+                Color(red: 0.16, green: 0.38, blue: 0.94),
+            ]
+        } else {
+            colors = [
+                Color(red: 0.90, green: 0.94, blue: 1.0),
+                Color(red: 0.52, green: 0.60, blue: 0.96),
+                Color(red: 0.34, green: 0.38, blue: 0.78),
+            ]
+        }
+        return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+private struct AudioBlobShape: Shape {
+    let phase: Double
+    let amplitude: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let pointCount = 96
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let baseRadius = min(rect.width, rect.height) * 0.43
+        var points: [CGPoint] = []
+        points.reserveCapacity(pointCount)
+
+        for index in 0..<pointCount {
+            let angle = Double(index) / Double(pointCount) * .pi * 2
+            let waveform = sin(angle * 3 + phase) * 0.52
+                + sin(angle * 5 - phase * 1.28) * 0.30
+                + sin(angle * 7 + phase * 0.72) * 0.18
+            let radius = baseRadius * (1 + amplitude * CGFloat(waveform))
+            points.append(
+                CGPoint(
+                    x: center.x + CGFloat(cos(angle)) * radius,
+                    y: center.y + CGFloat(sin(angle)) * radius
+                )
+            )
+        }
+
+        var path = Path()
+        guard let first = points.first else { return path }
+        path.move(to: first)
+        for point in points.dropFirst() { path.addLine(to: point) }
+        path.closeSubpath()
+        return path
     }
 }
 
