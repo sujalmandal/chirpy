@@ -243,11 +243,19 @@ MICROPHONE_PAGE = b"""<!doctype html>
     buffer.copyToChannel(samples, 0);
     const node = context.createBufferSource();
     const epoch = playbackEpoch;
+    let power = 0;
+    for (const sample of samples) power += sample * sample;
+    const rms = Math.sqrt(power / Math.max(1, samples.length));
     node.buffer = buffer;
     node.connect(context.destination);
     nextPlaybackTime = Math.max(nextPlaybackTime, context.currentTime + 0.025);
-    node.start(nextPlaybackTime);
+    const scheduledStart = nextPlaybackTime;
+    node.start(scheduledStart);
     nextPlaybackTime += buffer.duration;
+    const referenceDelay = Math.max(0, (scheduledStart - context.currentTime) * 1000);
+    setTimeout(() => {
+      if (epoch === playbackEpoch) post({ type: 'playback_reference', rms });
+    }, referenceDelay);
     playbackSources.add(node);
     node.onended = () => {
       playbackSources.delete(node);
@@ -563,6 +571,8 @@ class Agent:
         # Barge-in state: played-PCM RMS history and estimated echo coupling.
         self.played_rms: deque[tuple[float, float]] = deque(maxlen=64)
         self.played_now = 0.0
+        self.last_playback_reference_at = 0.0
+        self.playback_reference_logged = False
         self.coupling_k: float | None = None
         self.coupling_samples: list[float] = []
         self.barge_gate = BargeInGate(
@@ -571,7 +581,7 @@ class Agent:
         )
         self.barge_min_rms = float(config.get("BARGE_IN_MIN_RMS", "0.05"))
         self.barge_echo_multiplier = float(
-            config.get("BARGE_IN_ECHO_MULTIPLIER", "4.0")
+            config.get("BARGE_IN_ECHO_MULTIPLIER", "1.6")
         )
         self.barge_energy_confirmed_until = 0.0
         self.current_reply_text = ""
@@ -622,19 +632,14 @@ class Agent:
                 continue
             samples = np.frombuffer(pcm, dtype=np.float32)
             if samples.size:
-                rms = float(np.sqrt(np.mean(samples * samples)))
-                self.played_rms.append((time.time(), rms))
-                # Decaying played-energy: covers echo tails during generation
-                # pauses (moshi-mlx emits frames in bursts). Slow decay so the
-                # echo tail (longer than one 80 ms block) is still covered.
-                self.played_now = max(rms, self.played_now * 0.7)
                 self.turn_audio_bytes += len(pcm)
                 self.turn_audio_seconds += samples.size / SAMPLE_RATE
             await self.ws.send(pcm)
 
     def _played_energy(self) -> float:
-        """Current decayed played-RMS (echo tail aware)."""
-        return self.played_now
+        """RMS of audio the renderer reports as currently playing."""
+        age = time.time() - self.last_playback_reference_at
+        return self.played_now if age <= 0.20 else 0.0
 
     def _played_rms_delayed(self, delay: float = 0.08) -> float:
         """Played RMS from ~`delay` seconds ago (echo arrives at the mic late)."""
@@ -739,8 +744,9 @@ class Agent:
                     self.coupling_samples.append(rms / played_delayed)
                     if len(self.coupling_samples) >= 12:
                         self.coupling_samples.sort()
-                        # 90th percentile: echo is variable, worst case matters.
-                        idx = int(len(self.coupling_samples) * 0.9)
+                        # Median avoids user speech during calibration inflating
+                        # the echo estimate until real interruptions are ignored.
+                        idx = len(self.coupling_samples) // 2
                         self.coupling_k = max(0.1, self.coupling_samples[idx])
                         self.last_k_update = time.time()
                         debug(f"barge-in: coupling k={self.coupling_k:.3f}")
@@ -951,6 +957,9 @@ class Agent:
         self.barge_energy_confirmed_until = 0.0
         self.current_reply_text = ""
         self.played_now = 0.0
+        self.played_rms.clear()
+        self.last_playback_reference_at = 0.0
+        self.playback_reference_logged = False
         self.last_k_update = 0.0
         self.turn_audio_bytes = 0
         self.turn_audio_seconds = 0.0
@@ -1072,6 +1081,21 @@ class Agent:
                         stage = str(event.get("stage", "unknown"))[:80]
                         details = str(event.get("details", ""))[:500]
                         log(f"audio capture stage={stage} details={details}")
+                    elif event.get("type") == "playback_reference":
+                        try:
+                            rms = max(0.0, float(event.get("rms", 0.0)))
+                        except (TypeError, ValueError):
+                            rms = 0.0
+                        now = time.time()
+                        self.played_now = rms
+                        self.last_playback_reference_at = now
+                        self.played_rms.append((now, rms))
+                        if not self.playback_reference_logged:
+                            self.playback_reference_logged = True
+                            log(
+                                f"turn={self.current_turn_id or '-'} owner=assistant "
+                                f"state=playback_reference_active rms={rms:.4f}"
+                            )
                     elif event.get("type") == "playback_done":
                         if self.current_turn_id is not None:
                             log(

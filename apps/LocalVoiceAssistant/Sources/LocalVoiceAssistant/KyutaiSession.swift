@@ -632,6 +632,9 @@ final class KyutaiSession: NSObject, ObservableObject, WKScriptMessageHandler, W
             acceptWebPCM(data)
         case "playback_block_done":
             bufferFinished()
+        case "playback_reference":
+            guard let rms = body["rms"] as? Double else { return }
+            sendJSON(["type": "playback_reference", "rms": max(0, rms)])
         case "error":
             let message = body["message"] as? String ?? "unknown WebRTC error"
             reportCapture(stage: "webrtc_error", details: message)

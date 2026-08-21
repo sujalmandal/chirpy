@@ -207,8 +207,8 @@ class PlaybackEchoTests(unittest.TestCase):
             "stop", residual_confirmed=True
         ))
 
-    def test_multiword_speech_does_not_require_delayed_energy_overlap(self):
-        self.assertTrue(recognized_barge_in_ready(
+    def test_multiword_speech_still_requires_acoustic_confirmation(self):
+        self.assertFalse(recognized_barge_in_ready(
             "please stop talking", residual_confirmed=False
         ))
 
