@@ -11,7 +11,6 @@ emitted when the segment ends.
 from __future__ import annotations
 
 import asyncio
-import logging
 
 import numpy as np
 
@@ -27,8 +26,6 @@ from livekit.agents.stt import (
 from livekit.plugins import silero
 
 from faster_whisper import WhisperModel
-
-logger = logging.getLogger("chirpy.whisper_stt")
 
 SAMPLE_RATE = 16_000
 # Re-transcribe the in-progress segment roughly this often to refresh the
@@ -225,19 +222,10 @@ class _WhisperStream(RecognizeStream):
         interim_task = asyncio.create_task(_emit_interim(), name="emit_interim")
         recognize_task = asyncio.create_task(_recognize(), name="recognize")
         try:
-            # Only wait for input forwarding + VAD recognition to complete; the
-            # interim loop is intentionally infinite and is cancelled below.
-            done, pending = await asyncio.wait(
-                {forward_task, recognize_task},
-                return_when=asyncio.ALL_COMPLETED,
-                timeout=5,
-            )
-            for t in pending:
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
+            # Run all three loops for the life of the stream. This returns only
+            # when the stream is closed: `stream.aclose()` cancels our task,
+            # which propagates through `gather` and reaches the `finally`.
+            await asyncio.gather(forward_task, interim_task, recognize_task)
         finally:
             for task in (forward_task, interim_task, recognize_task):
                 await utils.aio.cancel_and_wait(task)
