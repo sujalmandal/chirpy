@@ -333,6 +333,26 @@ function renderDebug() {
         <button id="settings" title="Configure agent & LLM">${ICONS.gear} Settings</button>
         <button id="restart" title="Restart the engine">${ICONS.restart} Restart</button>
       </header>
+      <div class="sys-strip">
+        <div class="stages">
+          <div class="stage">VAD</div>
+          <div class="arrow">→</div>
+          <div class="stage">STT</div>
+          <div class="arrow">→</div>
+          <div class="stage">LLM</div>
+          <div class="arrow">→</div>
+          <div class="stage">TTS</div>
+        </div>
+        <div class="sys-info">
+          <span>STT <b>faster-whisper</b></span>
+          <span>TTS <b>Kokoro</b></span>
+          <span>VAD <b>Silero</b></span>
+          <span>Noise <b>DTLN</b></span>
+          <span class="sep">·</span>
+          <span>LLM <b id="llm-url">—</b></span>
+          <span>Model <b id="llm-model">—</b></span>
+        </div>
+      </div>
       <main>
         <section class="conversation">
           <div class="panel-head">
@@ -341,41 +361,14 @@ function renderDebug() {
           </div>
           <div id="messages" class="messages"></div>
         </section>
-        <aside class="side">
-          <div class="panel pipeline">
-            <h3>Voice pipeline</h3>
-            <div class="stages">
-              <div class="stage">VAD</div>
-              <div class="arrow">→</div>
-              <div class="stage">STT</div>
-              <div class="arrow">→</div>
-              <div class="stage">LLM</div>
-              <div class="arrow">→</div>
-              <div class="stage">TTS</div>
-            </div>
-            <div class="pipeline-detail">
-              <div><span>STT</span><b>faster-whisper</b></div>
-              <div><span>TTS</span><b>Kokoro</b></div>
-              <div><span>VAD</span><b>Silero</b></div>
-              <div><span>Noise</span><b>DTLN</b></div>
-            </div>
-          </div>
-          <div class="panel llm">
-            <h3>LLM</h3>
-            <div class="llm-info">
-              <div><span>Endpoint</span><b id="llm-url">—</b></div>
-              <div><span>Model</span><b id="llm-model">—</b></div>
-            </div>
-          </div>
-          <div class="panel logs">
-            <div class="panel-head">
-              <h3>Logs</h3>
-              <button id="open-logs" title="Open log files">Open</button>
-            </div>
-            <pre id="logs">Waiting for the Chirpy agent…</pre>
-          </div>
-        </aside>
       </main>
+      <section class="logs-panel">
+        <div class="panel-head">
+          <h3>Logs</h3>
+          <button id="open-logs" title="Open log files">Open</button>
+        </div>
+        <pre id="logs">Waiting for the Chirpy agent…</pre>
+      </section>
     </div>
   `;
   document.getElementById("restart")!.onclick = async () => {
@@ -401,8 +394,15 @@ function appendMessage(m: ChatMessage) {
     <span class="log-text">${escapeHtml(m.text) || (m.state === "streaming" ? "▍" : "")}</span>
   `;
   box.appendChild(el);
-  box.scrollTop = box.scrollHeight;
+  tailScroll(box);
   return el;
+}
+
+// Scroll a container to the bottom only if the user is already near the
+// bottom, so reading older content isn't yanked away by new messages/logs.
+function tailScroll(el: HTMLElement) {
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  if (nearBottom) el.scrollTop = el.scrollHeight;
 }
 
 function updateLastAssistant(delta: string) {
@@ -414,7 +414,7 @@ function updateLastAssistant(delta: string) {
     if (textEl) textEl.textContent = (textEl.textContent || "") + delta;
     const m = messages[messages.length - 1];
     if (m && m.role === "assistant") m.text += delta;
-    box.scrollTop = box.scrollHeight;
+    tailScroll(box);
   }
 }
 
@@ -519,7 +519,10 @@ async function pollMetrics() {
 async function pollLogs() {
   const logs = await invoke<string>("tail_logs");
   const el = document.getElementById("logs");
-  if (el) el.textContent = logs;
+  if (el) {
+    el.textContent = logs;
+    tailScroll(el);
+  }
 }
 
 // ---------------------------------------------------------------------------
