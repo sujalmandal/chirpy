@@ -284,7 +284,9 @@ const ICONS = {
 function renderOrb() {
   root.innerHTML = `
     <div class="orb-shell" id="orb-shell">
-      <div class="orb" id="orb"></div>
+      <div class="orb-wrap">
+        <div class="orb" id="orb"></div>
+      </div>
       <div class="caption" id="transcript"></div>
       <div class="caption reply" id="reply"></div>
       <div class="controls">
@@ -325,6 +327,7 @@ function renderDebug() {
     <div class="debug">
       <header>
         <div class="brand">Chirpy <span class="badge">debug</span></div>
+        <span class="status-dot" id="status-dot"></span>
         <span id="status" class="status">Getting ready</span>
         <span class="metrics" id="metrics"></span>
         <button id="settings" title="Configure agent & LLM">${ICONS.gear} Settings</button>
@@ -391,10 +394,11 @@ function appendMessage(m: ChatMessage) {
   const box = document.getElementById("messages");
   if (!box) return;
   const el = document.createElement("div");
-  el.className = `msg ${m.role} ${m.state}`;
+  el.className = `log-line ${m.role} ${m.state}`;
   el.innerHTML = `
-    <div class="msg-meta"><span class="who">${m.role === "user" ? "You" : "Chirpy"}</span><span class="time">${m.time}</span></div>
-    <div class="msg-text">${escapeHtml(m.text) || (m.state === "streaming" ? "…" : "")}</div>
+    <span class="log-time">${m.time}</span>
+    <span class="log-role">${m.role === "user" ? "you" : "chirpy"}</span>
+    <span class="log-text">${escapeHtml(m.text) || (m.state === "streaming" ? "▍" : "")}</span>
   `;
   box.appendChild(el);
   box.scrollTop = box.scrollHeight;
@@ -406,7 +410,7 @@ function updateLastAssistant(delta: string) {
   if (!box) return;
   const last = box.lastElementChild as HTMLElement | null;
   if (last && last.classList.contains("assistant")) {
-    const textEl = last.querySelector(".msg-text");
+    const textEl = last.querySelector(".log-text");
     if (textEl) textEl.textContent = (textEl.textContent || "") + delta;
     const m = messages[messages.length - 1];
     if (m && m.role === "assistant") m.text += delta;
@@ -482,11 +486,21 @@ async function pollStatus() {
     error: string | null;
   }>("backend_status");
   const el = document.getElementById("status");
+  const dot = document.getElementById("status-dot");
   if (el) {
-    if (!status.livekit_running) el.textContent = "LiveKit server not running";
-    else if (!status.agent_running) el.textContent = "Agent worker starting…";
-    else if (status.ready) el.textContent = "Chirpy ready";
-    else el.textContent = "Loading models…";
+    if (!status.livekit_running) {
+      el.textContent = "LiveKit server not running";
+      dot?.classList.add("error");
+    } else if (!status.agent_running) {
+      el.textContent = "Agent worker starting…";
+      dot?.classList.add("warn");
+    } else if (status.ready) {
+      el.textContent = "Chirpy ready";
+      dot?.classList.add("ok");
+    } else {
+      el.textContent = "Loading models…";
+      dot?.classList.add("warn");
+    }
   }
   // Only the main window drives the voice session; the debug window just
   // observes status and the conversation via events.
