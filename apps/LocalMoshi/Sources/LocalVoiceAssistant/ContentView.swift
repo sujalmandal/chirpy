@@ -367,7 +367,7 @@ struct DebugDashboardView: View {
     @ObservedObject var engine: KyutaiEngine
     @ObservedObject var metrics: SystemMetrics
     @EnvironmentObject private var settings: AppSettings
-    @State private var editingStage: PipelineStage?
+    @State private var isEditingLLM = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -400,8 +400,8 @@ struct DebugDashboardView: View {
                 .padding(20)
             }
         }
-        .sheet(item: $editingStage) { stage in
-            PipelineStageEditor(stage: stage, engine: engine)
+        .sheet(isPresented: $isEditingLLM) {
+            LLMSettingsEditor(engine: engine)
                 .environmentObject(settings)
         }
     }
@@ -411,35 +411,35 @@ struct DebugDashboardView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Voice pipeline").font(.title3.bold())
-                    Text("Every stage is configurable. Changes apply after an engine restart.")
+                    Text("The local speech pipeline is built in. Only the LLM connection is configurable.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Text("Agent: \(settings.agentName)").font(.caption).foregroundStyle(.secondary)
             }
             HStack(spacing: 10) {
-                stageCard(.vad, settings.vadRepo)
+                fixedStageCard(.vad, "Built-in")
                 Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                stageCard(.stt, settings.sttRepo)
+                fixedStageCard(.stt, "Built-in")
                 Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                stageCard(.llm, settings.llmModel)
+                llmStageCard
                 Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                stageCard(.tts, settings.ttsRepo)
+                fixedStageCard(.tts, "Built-in")
             }
         }
         .padding(16)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14))
     }
 
-    private func stageCard(_ stage: PipelineStage, _ value: String) -> some View {
-        Button { editingStage = stage } label: {
+    private var llmStageCard: some View {
+        Button { isEditingLLM = true } label: {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Label(stage.rawValue, systemImage: stage.icon).font(.headline)
+                    Label("LLM", systemImage: PipelineStage.llm.icon).font(.headline)
                     Spacer()
                     Image(systemName: "slider.horizontal.3").foregroundStyle(.secondary)
                 }
-                Text(value).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                Text(settings.llmModel).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
             .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
             .padding(12)
@@ -447,6 +447,21 @@ struct DebugDashboardView: View {
             .overlay(RoundedRectangle(cornerRadius: 11).stroke(.separator.opacity(0.45)))
         }
         .buttonStyle(.plain)
+    }
+
+    private func fixedStageCard(_ stage: PipelineStage, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(stage.rawValue, systemImage: stage.icon).font(.headline)
+                Spacer()
+                Image(systemName: "lock.fill").font(.caption).foregroundStyle(.tertiary)
+            }
+            Text(value).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
+        .padding(12)
+        .background(.background, in: RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(.separator.opacity(0.45)))
     }
 
     private func metric(_ name: String, _ value: String) -> some View {
