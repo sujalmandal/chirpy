@@ -2,7 +2,7 @@
 .idea/
 **/.venv/
 **/__pycache__/
-apps/LocalMoshi/.build/
+**/.build/
 config/local.env
 logs/
 *.app/

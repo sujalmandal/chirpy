@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +64,9 @@ class TurnCancelled(Exception):
 MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
 
 LOG_PATH = ROOT / "logs" / "kyutai-agent.log"
+LOG_BACKUP_PATH = ROOT / "logs" / "kyutai-agent.log.1"
+LOG_MAX_BYTES = 2_000_000
+LOG_LOCK = threading.Lock()
 
 DEBUG = False
 
@@ -75,13 +79,18 @@ def log(message: str) -> None:
     """
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n"
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "a") as fobj:
-            fobj.write(line)
+        with LOG_LOCK:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
+                if LOG_BACKUP_PATH.exists():
+                    LOG_BACKUP_PATH.unlink()
+                LOG_PATH.replace(LOG_BACKUP_PATH)
+            with open(LOG_PATH, "a") as fobj:
+                fobj.write(line)
     except OSError:
         pass
     try:
-        print(message, flush=True)
+        print(line.rstrip(), flush=True)
     except (BrokenPipeError, OSError):
         pass
 
@@ -93,13 +102,16 @@ def debug(message: str) -> None:
 
 
 def load_config() -> dict[str, str]:
-    values = dict(os.environ)
+    values: dict[str, str] = {}
     if CONFIG.exists():
         for raw in CONFIG.read_text().splitlines():
             line = raw.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 values[key.strip()] = value.strip()
+    # Explicit process environment always wins. The macOS app supplies its
+    # persisted UI settings here, while local.env remains a CLI-friendly fallback.
+    values.update(os.environ)
     return values
 
 
@@ -108,7 +120,10 @@ def load_config() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def complete_url(base_url: str) -> str:
-    return base_url.rstrip("/") + "/chat/completions"
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    return normalized + "/chat/completions"
 
 
 def stream_chat(text: str, session_id: str, config: dict[str, str]):
@@ -158,15 +173,16 @@ def stream_chat(text: str, session_id: str, config: dict[str, str]):
 # ---------------------------------------------------------------------------
 
 _READY = {"stt_ready": False, "tts_ready": False, "config": {}}
+_READY.update({"stt_error": None, "stt_error_count": 0, "stt_last_recovery": None})
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     server_version = "LocalVoiceAgent/0.2"
 
     def log_message(self, format: str, *args: object) -> None:
-        # File-backed and exception-safe so a broken stdout never aborts a
-        # response (send_response() logs before writing the body).
-        log(format % args)
+        # Health is polled continuously by the macOS app. Logging every request
+        # would add thousands of low-value lines per hour.
+        return
 
     def do_GET(self) -> None:
         if self.path != "/health":
@@ -179,6 +195,13 @@ class HealthHandler(BaseHTTPRequestHandler):
             "stt_ready": _READY["stt_ready"],
             "tts_ready": _READY["tts_ready"],
             "llm_configured": bool(cfg.get("LLM_BASE_URL") and cfg.get("LLM_MODEL_NAME")),
+            "agent_name": cfg.get("AGENT_NAME", "Nova"),
+            "vad_model": cfg.get("VAD_REPO", cfg.get("STT_REPO", "")),
+            "stt_model": cfg.get("STT_REPO", ""),
+            "tts_model": cfg.get("TTS_REPO", ""),
+            "stt_error": _READY["stt_error"],
+            "stt_error_count": _READY["stt_error_count"],
+            "stt_last_recovery": _READY["stt_last_recovery"],
         }
         body = json.dumps(payload).encode()
         self.send_response(200)
@@ -213,7 +236,13 @@ class SpeechToText:
         generated_codebooks = lm_config.generated_codebooks
         self.other_codebooks = lm_config.other_codebooks
         num_codebooks = max(generated_codebooks, self.other_codebooks)
-        self.audio_tokenizer = rustymimi.Tokenizer(str(mimi_weights), num_codebooks=num_codebooks)
+        self.mimi_weights = str(mimi_weights)
+        self.num_codebooks = num_codebooks
+        self.audio_tokenizer = self._new_audio_tokenizer()
+        # rustymimi advances more than one internal position for some audio
+        # blocks. Rotate well before its fixed 8192-position RoPE table fills.
+        self.rotate_blocks = max(500, int(config.get("STT_ROTATE_BLOCKS", "3000")))
+        self.blocks_since_hard_reset = 0
         log("STT: warming up")
         self.lm.warmup()
         self.buffer = bytearray()
@@ -228,18 +257,29 @@ class SpeechToText:
             check=False,
         )
 
-    def reset(self):
-        self.gen = self._new_gen()
-        self.buffer = bytearray()
-        self.audio_tokenizer.reset()
-        # The Lm model keeps a KV cache shared across LmGen instances; it must be
-        # cleared too or the next step overflows its fixed max_seq_len window and
-        # every block errors with "narrow invalid args" (the stall where speech is
-        # no longer transcribed).
+    def _new_audio_tokenizer(self):
+        return rustymimi.Tokenizer(self.mimi_weights, num_codebooks=self.num_codebooks)
+
+    def reset(self, hard: bool = False):
+        # Clear model caches before constructing the next generator. Reversing
+        # this order can leave the new LmGen attached to state from the old turn.
         for c in self.lm.transformer_cache:
             c.reset()
         for c in self.lm.depformer_cache:
             c.reset()
+        self.buffer = bytearray()
+        if hard:
+            # rustymimi.Tokenizer.reset() does not reliably recover after its
+            # internal positional context has overflowed. Recreate the tokenizer
+            # from the already-cached weights for a true streaming-state reset.
+            self.audio_tokenizer = self._new_audio_tokenizer()
+            self.blocks_since_hard_reset = 0
+        else:
+            self.audio_tokenizer.reset()
+        self.gen = self._new_gen()
+
+    def should_rotate(self) -> bool:
+        return self.blocks_since_hard_reset >= self.rotate_blocks
 
     def step(self, pcm_float32: bytes) -> tuple[str | None, float]:
         """Feed arbitrary-size PCM bytes; returns (new text fragment, VAD prob).
@@ -265,6 +305,7 @@ class SpeechToText:
         vad_prob = 0.0
         if extra_heads and len(extra_heads) > 2:
             vad_prob = extra_heads[2][0, 0, 0].item()
+        self.blocks_since_hard_reset += 1
         return fragment, vad_prob
 
 
@@ -359,13 +400,16 @@ class TextToSpeech:
 # ---------------------------------------------------------------------------
 
 class Agent:
+    active_session_id: str | None = None
+    next_turn_id = 0
     def __init__(self, config: dict[str, str], websocket):
         self.config = config
         self.ws = websocket
-        self.session_id = "default"
-        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.session_id = str(uuid.uuid4())
+        self.mic_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
         self.tts_queue: asyncio.Queue = asyncio.Queue()
         self.current_turn: asyncio.Task | None = None
+        self.current_turn_id: int | None = None
         self.epoch = 0
         self.loop: asyncio.AbstractEventLoop | None = None
         self.playback_active = False
@@ -385,8 +429,16 @@ class Agent:
         self.turn_audio_seconds = 0.0
         self.session_audio_seconds = 0.0
         self.session_text_chars = 0
+        self.energy_threshold = max(0.0001, float(config.get("VAD_THRESHOLD", "0.01")))
+        self.min_speech_blocks = max(1, round(float(config.get("VAD_MIN_SPEECH_MS", "320")) / 80))
+        self.min_silence_blocks = max(1, round(float(config.get("VAD_MIN_SILENCE_MS", "320")) / 80))
+        self.semantic_threshold = min(1.0, max(0.0, float(config.get("VAD_SEMANTIC_THRESHOLD", "0.6"))))
+        self.stt_error_streak = 0
+        self.stt_suppressed_errors = 0
+        self.stt_last_error_log = 0.0
 
     async def send_event(self, **payload):
+        payload.setdefault("timestamp", time.time())
         await self.ws.send(json.dumps(payload))
 
     async def _mlx(self, fn, *args):
@@ -430,17 +482,38 @@ class Agent:
                 break
         return best
 
-    async def _barge_in(self):
-        """Cancel the current turn and notify the client the user interrupted."""
+    async def _cancel_current_turn(self, reason: str, cancelled_by: str, reset_stt: bool = False):
+        """Cancel assistant generation/playback with an explicit audit reason."""
+        turn_id = self.current_turn_id
+        had_active_turn = self.playback_active or (self.current_turn is not None and not self.current_turn.done())
+        if not had_active_turn:
+            return
         self.cancel_flag = True
         self.epoch += 1
         self.playback_active = False
+        self.synthesizing = False
         if self.current_turn and not self.current_turn.done():
             self.current_turn.cancel()
-        await self.send_event(type="interrupted")
-        await self._mlx(Agent.stt.reset)
-        log(f"turn audio: {self.turn_audio_seconds:.1f} s ({self.turn_audio_bytes} bytes) — cancelled")
-        debug("barge-in: turn cancelled, STT reset")
+        await self.send_event(
+            type="interrupted",
+            turn_id=turn_id,
+            owner="assistant",
+            cancelled_by=cancelled_by,
+            reason=reason,
+        )
+        log(
+            f"turn={turn_id or '-'} owner=assistant state=cancelled "
+            f"by={cancelled_by} reason={reason} "
+            f"audio_seconds={self.turn_audio_seconds:.1f} audio_bytes={self.turn_audio_bytes}"
+        )
+        if reset_stt:
+            await self._mlx(Agent.stt.reset)
+        self.current_turn_id = None
+
+    async def _barge_in(self):
+        """Cancel the assistant because VAD detected user speech over playback."""
+        await self._cancel_current_turn("vad_barge_in", "user", reset_stt=True)
+        debug("barge-in: assistant turn cancelled, STT reset")
 
     async def stt_loop(self):
         """Consume mic PCM, detect end-of-turn, and handle barge-in.
@@ -453,8 +526,11 @@ class Agent:
         fragments: list[str] = []
         speech_run = 0
         silence_run = 0
+        semantic_pause_run = 0
         grace_until = 0.0
         while True:
+            if self.session_id != Agent.active_session_id:
+                return
             try:
                 pcm = await asyncio.wait_for(self.mic_queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
@@ -528,50 +604,102 @@ class Agent:
                 debug(f"stt: idle rms={rms:.4f} speech_run={speech_run} silence_run={silence_run} fragments={len(fragments)}")
 
             try:
-                fragment, _vad = await self._mlx(stt.step, pcm)
+                fragment, vad_probability = await self._mlx(stt.step, pcm)
             except Exception as error:
-                log(f"STT step error: {error}")
-                await self._mlx(stt.reset)
+                self.stt_error_streak += 1
+                _READY["stt_ready"] = False
+                _READY["stt_error"] = str(error)
+                _READY["stt_error_count"] += 1
+                now = time.time()
+                if self.stt_last_error_log == 0.0 or now - self.stt_last_error_log >= 10.0:
+                    suffix = f" ({self.stt_suppressed_errors} repeated errors suppressed)" if self.stt_suppressed_errors else ""
+                    log(f"STT step error: {error}{suffix}; performing hard recovery")
+                    self.stt_last_error_log = now
+                    self.stt_suppressed_errors = 0
+                else:
+                    self.stt_suppressed_errors += 1
+                try:
+                    await self._mlx(stt.reset, True)
+                    _READY["stt_last_recovery"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                except Exception as reset_error:
+                    _READY["stt_error"] = f"Recovery failed: {reset_error}"
+                    log(f"STT hard recovery failed: {reset_error}")
+                    await asyncio.sleep(1.0)
                 fragments.clear()
                 speech_run = 0
                 silence_run = 0
+                semantic_pause_run = 0
                 continue
+            if self.stt_error_streak:
+                log(f"STT recovered after {self.stt_error_streak} failed block(s)")
+                self.stt_error_streak = 0
+                self.stt_suppressed_errors = 0
+                self.stt_last_error_log = 0.0
+                _READY["stt_error"] = None
+                _READY["stt_ready"] = True
             if fragment:
                 fragments.append(fragment)
                 partial = "".join(fragments).strip()
                 await self.send_event(type="partial", text=partial)
             # Energy gate: track consecutive blocks above/below the speech level.
-            if rms >= 0.01:
+            if rms >= self.energy_threshold:
                 speech_run += 1
                 silence_run = 0
             else:
                 silence_run += 1
+            if speech_run >= self.min_speech_blocks and vad_probability >= self.semantic_threshold:
+                semantic_pause_run += 1
+            else:
+                semantic_pause_run = 0
             # The STT LmGen has a finite step window (~8192 blocks); it steps on
             # idle silence too, so reset it during long silences to avoid the
             # "narrow invalid args" overflow that would otherwise stall listening
             # after ~11 minutes.
-            if silence_run >= 120 and not fragments:
+            if stt.should_rotate() and not fragments:
+                await self._mlx(stt.reset, True)
+                log("STT context rotated before positional limit")
+                speech_run = 0
+                silence_run = 0
+            elif silence_run >= 120 and not fragments:
                 await self._mlx(stt.reset)
                 speech_run = 0
                 silence_run = 0
-            if speech_run >= 4 and silence_run >= 4:
+            semantic_end = semantic_pause_run >= 2 and silence_run >= 1
+            energy_end = speech_run >= self.min_speech_blocks and silence_run >= self.min_silence_blocks
+            if semantic_end or energy_end:
+                endpoint_reason = "semantic_vad" if semantic_end else "silence_timeout"
+                endpoint_speech_ms = speech_run * 80
+                endpoint_silence_ms = silence_run * 80
+                endpoint_probability = vad_probability
                 transcript = await self._finalize(stt, fragments)
                 fragments = []
                 speech_run = 0
                 silence_run = 0
+                semantic_pause_run = 0
                 while not self.mic_queue.empty():
                     self.mic_queue.get_nowait()
                 if not transcript:
+                    log(
+                        "turn=- owner=user state=discarded reason=empty_transcript "
+                        f"endpoint={endpoint_reason} speech_ms={endpoint_speech_ms} "
+                        f"silence_ms={endpoint_silence_ms} vad_probability={endpoint_probability:.3f}"
+                    )
                     continue
                 # If a turn is still running (e.g. LLM still streaming), cancel
                 # it and start the new one with the fresh transcript.
                 if self.current_turn is not None and not self.current_turn.done():
-                    self.cancel_flag = True
-                    self.epoch += 1
-                    self.current_turn.cancel()
-                    await self.send_event(type="interrupted")
-                    debug("stt: superseded running turn with new transcript")
-                self.current_turn = asyncio.create_task(self.run_turn(transcript))
+                    await self._cancel_current_turn("new_user_turn_detected", "user")
+                Agent.next_turn_id += 1
+                turn_id = Agent.next_turn_id
+                self.current_turn_id = turn_id
+                log(
+                    f"turn={turn_id} owner=user state=completed endpoint={endpoint_reason} "
+                    f"speech_ms={endpoint_speech_ms} silence_ms={endpoint_silence_ms} "
+                    f"vad_probability={endpoint_probability:.3f} transcript={transcript!r}"
+                )
+                self.current_turn = asyncio.create_task(
+                    self.run_turn(transcript, turn_id, endpoint_reason)
+                )
 
     async def _finalize(self, stt, fragments: list[str]) -> str:
         """Feed trailing silence to flush the delayed STT output, then reset."""
@@ -582,7 +710,7 @@ class Agent:
         await self._mlx(stt.reset)
         return "".join(fragments).strip()
 
-    async def run_turn(self, transcript: str):
+    async def run_turn(self, transcript: str, turn_id: int, endpoint_reason: str):
         self.epoch += 1
         epoch = self.epoch
         self.cancel_flag = False
@@ -593,9 +721,12 @@ class Agent:
         self.last_k_update = 0.0
         self.turn_audio_bytes = 0
         self.turn_audio_seconds = 0.0
-        log(f"turn transcript: {transcript!r}")
-        await self.send_event(type="transcript", text=transcript)
-        await self.send_event(type="turn_started")
+        await self.send_event(
+            type="transcript", text=transcript, turn_id=turn_id,
+            owner="user", endpoint=endpoint_reason,
+        )
+        log(f"turn={turn_id} owner=assistant state=started reason=user_turn_completed")
+        await self.send_event(type="turn_started", turn_id=turn_id, owner="assistant")
         reply = ""
         try:
             async for delta in self._llm_stream_async(transcript):
@@ -604,37 +735,44 @@ class Agent:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            await self.send_event(type="error", message=str(error))
+            log(f"turn={turn_id} owner=assistant state=failed reason=llm_error error={error}")
+            await self.send_event(type="error", message=str(error), turn_id=turn_id, owner="assistant")
             return
         if not reply.strip():
-            await self.send_event(type="done")
+            log(f"turn={turn_id} owner=assistant state=completed reason=empty_llm_reply")
+            await self.send_event(type="done", turn_id=turn_id, owner="assistant")
             return
-        log(f"turn text: {len(reply)} chars")
+        log(f"turn={turn_id} owner=assistant state=reply_ready text_chars={len(reply)}")
         self.playback_active = True
         self.synthesizing = True
         self.playback_started = time.time()
-        log(f"turn flushed: {len(reply)} chars → TTS")
+        log(f"turn={turn_id} owner=assistant state=synthesizing text_chars={len(reply)}")
         try:
             await self._mlx(self._tts_synthesize, reply, epoch)
         except asyncio.CancelledError:
             raise
         except TurnCancelled:
-            debug("turn cancelled during TTS")
+            debug(f"turn={turn_id}: TTS observed cancellation flag")
             return
         except Exception as error:
-            await self.send_event(type="error", message=f"TTS: {error}")
+            log(f"turn={turn_id} owner=assistant state=failed reason=tts_error error={error}")
+            await self.send_event(
+                type="error", message=f"TTS: {error}", turn_id=turn_id, owner="assistant"
+            )
         self.synthesizing = False
         HISTORY.setdefault(self.session_id, []).extend(
             [{"role": "user", "content": transcript}, {"role": "assistant", "content": reply}]
         )
+        HISTORY[self.session_id] = HISTORY[self.session_id][-12:]
         self.session_audio_seconds += self.turn_audio_seconds
         self.session_text_chars += len(reply)
         log(
-            f"turn complete, reply={len(reply)} chars · "
-            f"turn audio: {self.turn_audio_seconds:.1f} s ({self.turn_audio_bytes} bytes) · "
-            f"session audio: {self.session_audio_seconds:.1f} s · session text: {self.session_text_chars} chars"
+            f"turn={turn_id} owner=assistant state=audio_ready reply_chars={len(reply)} "
+            f"audio_seconds={self.turn_audio_seconds:.1f} audio_bytes={self.turn_audio_bytes} "
+            f"session_audio_seconds={self.session_audio_seconds:.1f} "
+            f"session_text_chars={self.session_text_chars}"
         )
-        await self.send_event(type="done")
+        await self.send_event(type="done", turn_id=turn_id, owner="assistant")
 
     async def _llm_stream_async(self, transcript: str):
         """Bridge the synchronous `stream_chat` generator into async deltas."""
@@ -671,11 +809,16 @@ class Agent:
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
+        Agent.active_session_id = self.session_id
         stt_task = asyncio.create_task(self.stt_loop())
         writer_task = asyncio.create_task(self.out_writer())
         try:
             async for message in self.ws:
                 if isinstance(message, bytes):
+                    if self.session_id != Agent.active_session_id:
+                        continue
+                    if self.mic_queue.full():
+                        self.mic_queue.get_nowait()
                     self.mic_queue.put_nowait(message)
                 else:
                     try:
@@ -683,13 +826,14 @@ class Agent:
                     except json.JSONDecodeError:
                         continue
                     if event.get("type") == "interrupt":
-                        self.epoch += 1
-                        self.playback_active = False
-                        self.cancel_flag = True
-                        if self.current_turn and not self.current_turn.done():
-                            self.current_turn.cancel()
-                        await self._mlx(Agent.stt.reset)
+                        await self._cancel_current_turn("manual_interrupt", "user", reset_stt=True)
                     elif event.get("type") == "playback_done":
+                        if self.current_turn_id is not None:
+                            log(
+                                f"turn={self.current_turn_id} owner=assistant "
+                                "state=completed reason=playback_finished"
+                            )
+                            self.current_turn_id = None
                         self.playback_active = False
                         self.cancel_flag = False
                         await self._mlx(Agent.stt.reset)
@@ -698,6 +842,20 @@ class Agent:
         finally:
             stt_task.cancel()
             writer_task.cancel()
+            if self.current_turn and not self.current_turn.done():
+                self.current_turn.cancel()
+                reason = (
+                    "session_superseded"
+                    if Agent.active_session_id not in (None, self.session_id)
+                    else "client_disconnected"
+                )
+                log(
+                    f"turn={self.current_turn_id or '-'} owner=assistant "
+                    f"state=cancelled by=system reason={reason}"
+                )
+            if Agent.active_session_id == self.session_id:
+                Agent.active_session_id = None
+            HISTORY.pop(self.session_id, None)
 
 
 def main():
@@ -711,6 +869,10 @@ def main():
     log("Loading Kyutai models (first run downloads weights)…")
     if DEBUG:
         log("debug logging enabled")
+    vad_repo = config.get("VAD_REPO", config.get("STT_REPO", "")).strip()
+    stt_repo = config.get("STT_REPO", "kyutai/stt-1b-en_fr-candle").strip()
+    if vad_repo and vad_repo != stt_repo:
+        log(f"VAD model {vad_repo!r} selected; using the semantic VAD head bundled with {stt_repo!r} until a matching adapter is installed")
     Agent.stt = SpeechToText(config)
     _READY["stt_ready"] = True
     log("STT ready")

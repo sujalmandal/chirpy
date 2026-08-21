@@ -1,0 +1,140 @@
+import Foundation
+import Security
+
+enum AppMode: String, CaseIterable, Identifiable {
+    case assistant
+    case debug
+
+    var id: String { rawValue }
+    var title: String { self == .assistant ? "Assistant" : "Debug" }
+    var icon: String { self == .assistant ? "sparkles" : "wrench.and.screwdriver" }
+}
+
+enum PipelineStage: String, CaseIterable, Identifiable {
+    case vad = "VAD"
+    case stt = "STT"
+    case llm = "LLM"
+    case tts = "TTS"
+
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .vad: "waveform.badge.magnifyingglass"
+        case .stt: "text.bubble"
+        case .llm: "brain.head.profile"
+        case .tts: "speaker.wave.2"
+        }
+    }
+}
+
+@MainActor
+final class AppSettings: ObservableObject {
+    private enum Key {
+        static let mode = "ui.mode"
+        static let agentName = "agent.name"
+        static let llmURL = "pipeline.llm.url"
+        static let llmModel = "pipeline.llm.model"
+        static let systemPrompt = "agent.systemPrompt"
+    }
+
+    private enum FixedVoicePipeline {
+        static let vadRepo = "kyutai/stt-1b-en_fr-candle"
+        static let vadThreshold = 0.01
+        static let minSpeechMS = 320
+        static let minSilenceMS = 320
+        static let sttRepo = "kyutai/stt-1b-en_fr-candle"
+        static let ttsRepo = "kyutai/tts-1.6b-en_fr"
+        static let ttsVoiceRepo = "kyutai/tts-voices"
+        static let ttsVoice = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+        static let ttsQuantize = 8
+    }
+
+    private let defaults = UserDefaults.standard
+
+    @Published var mode: AppMode { didSet { defaults.set(mode.rawValue, forKey: Key.mode) } }
+    @Published var agentName: String { didSet { defaults.set(agentName, forKey: Key.agentName) } }
+    @Published var llmURL: String { didSet { defaults.set(llmURL, forKey: Key.llmURL) } }
+    @Published var llmModel: String { didSet { defaults.set(llmModel, forKey: Key.llmModel) } }
+    @Published var llmAPIKey: String
+    @Published var systemPrompt: String { didSet { defaults.set(systemPrompt, forKey: Key.systemPrompt) } }
+
+    init() {
+        mode = AppMode(rawValue: defaults.string(forKey: Key.mode) ?? "") ?? .assistant
+        agentName = defaults.string(forKey: Key.agentName) ?? "Nova"
+        llmURL = defaults.string(forKey: Key.llmURL) ?? "http://localhost:1234/v1"
+        llmModel = defaults.string(forKey: Key.llmModel) ?? "liquid/lfm2.5-1.2b"
+        llmAPIKey = KeychainStore.read(account: "llm-api-key") ?? ""
+        systemPrompt = defaults.string(forKey: Key.systemPrompt) ?? "Be concise, warm, and natural. Prefer short spoken answers unless the user asks for detail."
+    }
+
+    var validationIssues: [String] {
+        var issues: [String] = []
+        if agentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { issues.append("Agent name is required") }
+        if URL(string: llmURL)?.scheme == nil { issues.append("Enter a valid LLM endpoint") }
+        if llmModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { issues.append("Enter an LLM model name") }
+        return issues
+    }
+
+    var engineEnvironment: [String: String] {
+        let name = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            "AGENT_NAME": name,
+            "ASSISTANT_SYSTEM": "Your name is \(name). \(systemPrompt)",
+            "VAD_REPO": FixedVoicePipeline.vadRepo,
+            "VAD_THRESHOLD": String(FixedVoicePipeline.vadThreshold),
+            "VAD_MIN_SPEECH_MS": String(FixedVoicePipeline.minSpeechMS),
+            "VAD_MIN_SILENCE_MS": String(FixedVoicePipeline.minSilenceMS),
+            "STT_REPO": FixedVoicePipeline.sttRepo,
+            "LLM_BASE_URL": llmURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            "LLM_MODEL_NAME": llmModel.trimmingCharacters(in: .whitespacesAndNewlines),
+            "LLM_API_KEY": llmAPIKey,
+            "TTS_REPO": FixedVoicePipeline.ttsRepo,
+            "TTS_VOICE_REPO": FixedVoicePipeline.ttsVoiceRepo,
+            "TTS_VOICE": FixedVoicePipeline.ttsVoice,
+            "TTS_QUANTIZE": String(FixedVoicePipeline.ttsQuantize),
+        ]
+    }
+
+    func persistCredential() {
+        if llmAPIKey.isEmpty { KeychainStore.delete(account: "llm-api-key") }
+        else { KeychainStore.write(llmAPIKey, account: "llm-api-key") }
+    }
+}
+
+private enum KeychainStore {
+    private static let service = "dev.localvoiceassistant.settings"
+
+    static func read(account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func write(_ value: String, account: String) {
+        delete(account: account)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: Data(value.utf8),
+        ]
+        SecItemAdd(query as CFDictionary, nil)
+    }
+
+    static func delete(account: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}

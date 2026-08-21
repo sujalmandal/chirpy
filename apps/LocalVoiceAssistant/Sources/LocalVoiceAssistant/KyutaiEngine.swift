@@ -17,12 +17,24 @@ final class KyutaiEngine: ObservableObject {
     private var launched = false
     private var healthTask: Task<Void, Never>?
     private var logHandle: FileHandle?
+    private var configuration: [String: String] = [:]
     private let readyTimeoutSeconds: Double = 120
 
     init() { Self.shared = self }
 
-    func startIfNeeded() { guard !launched else { return }; launched = true; start() }
-    func restart() { stop(); launched = true; start() }
+    func startIfNeeded(configuration: [String: String]) {
+        guard !launched else { return }
+        self.configuration = configuration
+        launched = true
+        start()
+    }
+
+    func restart(configuration: [String: String]) {
+        self.configuration = configuration
+        stop()
+        launched = true
+        start()
+    }
 
     func start() {
         isStarting = true; isReady = false; sttReady = false; ttsReady = false
@@ -41,6 +53,7 @@ final class KyutaiEngine: ObservableObject {
         task.executableURL = venv
         task.arguments = [script.path]
         task.currentDirectoryURL = root
+        task.environment = ProcessInfo.processInfo.environment.merging(configuration) { _, configured in configured }
         let output = Pipe()
         task.standardOutput = output; task.standardError = output
         pipe = output
@@ -87,7 +100,7 @@ final class KyutaiEngine: ObservableObject {
         FileManager.default.createFile(atPath: file.path, contents: nil)
         logHandle?.closeFile()
         logHandle = try? FileHandle(forWritingTo: file)
-        try? logHandle?.seekToEnd()
+        _ = try? logHandle?.seekToEnd()
     }
 
     private func closeLog() {
@@ -113,34 +126,42 @@ final class KyutaiEngine: ObservableObject {
         healthTask = Task { [weak self] in
             guard let self else { return }
             let deadline = Date().addingTimeInterval(readyTimeoutSeconds)
+            var hasBeenReady = false
             while !Task.isCancelled {
                 let healthy = await self.health()
-                if self.isReady != healthy.stt || self.isReady != healthy.tts {
-                    self.isReady = healthy.stt && healthy.tts
-                    self.sttReady = healthy.stt
-                    self.ttsReady = healthy.tts
-                    self.status = self.isReady ? "Local voice engine ready" : self.status
-                    if self.isReady { self.isStarting = false; return }
+                self.isReady = healthy.stt && healthy.tts
+                self.sttReady = healthy.stt
+                self.ttsReady = healthy.tts
+                if self.isReady {
+                    hasBeenReady = true
+                    self.status = "Local voice engine ready"
+                    self.isStarting = false
+                } else if hasBeenReady, let error = healthy.error {
+                    self.status = "Speech recognition recovering: \(error)"
+                    self.isStarting = false
                 }
-                if Date() >= deadline {
+                if !hasBeenReady && Date() >= deadline {
                     self.isStarting = false
                     self.status = "Voice engine did not start — see logs/kyutai-agent.log"
-                    return
                 }
                 try? await Task.sleep(for: .milliseconds(600))
             }
         }
     }
 
-    private func health() async -> (stt: Bool, tts: Bool) {
+    private func health() async -> (stt: Bool, tts: Bool, error: String?) {
         var request = URLRequest(url: baseURL.appending(path: "health"))
         request.timeoutInterval = 1; request.cachePolicy = .reloadIgnoringLocalCacheData
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return (false, false)
+            return (false, false, "local engine is unreachable")
         }
-        return (json["stt_ready"] as? Bool ?? false, json["tts_ready"] as? Bool ?? false)
+        return (
+            json["stt_ready"] as? Bool ?? false,
+            json["tts_ready"] as? Bool ?? false,
+            json["stt_error"] as? String
+        )
     }
 
     private func stopStaleAgent() {
