@@ -37,7 +37,6 @@ private struct AssistantView: View {
     var body: some View {
         VStack(spacing: 10) {
             VoiceOrb(
-                micLevel: session.micLevel,
                 speakerLevel: session.speakerLevel,
                 isListening: session.isListening,
                 isSpeaking: session.isSpeaking
@@ -178,7 +177,6 @@ private struct AssistantView: View {
 }
 
 private struct VoiceOrb: View {
-    let micLevel: Float
     let speakerLevel: Float
     let isListening: Bool
     let isSpeaking: Bool
@@ -187,19 +185,15 @@ private struct VoiceOrb: View {
         GeometryReader { geometry in
             TimelineView(.animation(minimumInterval: 1 / 30)) { timeline in
                 let time = timeline.date.timeIntervalSinceReferenceDate
-                let input = CGFloat(min(max(micLevel * 8, 0), 1))
                 let output = CGFloat(min(max(speakerLevel * 4, 0), 1))
-                let level = isSpeaking ? max(0.14, output) : (isListening ? input : 0)
                 let size = min(geometry.size.width, geometry.size.height)
-                let blob = AudioBlobShape(
-                    phase: time * (isSpeaking ? 3.4 : 1.45),
-                    amplitude: isSpeaking ? 0.055 + level * 0.105 : 0.018 + level * 0.045
-                )
+                let restingBeat = CGFloat((sin(time * 7.2) + 1) * 0.008)
+                let beat = isSpeaking ? 1 + max(restingBeat, output * 0.09) : 1
                 ZStack {
-                    blob
+                    Circle()
                         .fill(orbGradient)
                         .shadow(color: glowColor.opacity(isSpeaking ? 0.44 : 0.26), radius: isSpeaking ? 8 : 5)
-                    blob
+                    Circle()
                         .fill(
                             RadialGradient(
                                 colors: [.white.opacity(0.58), .white.opacity(0.10), .clear],
@@ -208,11 +202,11 @@ private struct VoiceOrb: View {
                                 endRadius: size * 0.46
                             )
                         )
-                    blob
+                    Circle()
                         .stroke(.white.opacity(0.52), lineWidth: 1.15)
                 }
                 .padding(size * 0.10)
-                .scaleEffect(1 + level * 0.035)
+                .scaleEffect(beat)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -248,40 +242,6 @@ private struct VoiceOrb: View {
             ]
         }
         return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
-    }
-}
-
-private struct AudioBlobShape: Shape {
-    let phase: Double
-    let amplitude: CGFloat
-
-    func path(in rect: CGRect) -> Path {
-        let pointCount = 96
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        let baseRadius = min(rect.width, rect.height) * 0.43
-        var points: [CGPoint] = []
-        points.reserveCapacity(pointCount)
-
-        for index in 0..<pointCount {
-            let angle = Double(index) / Double(pointCount) * .pi * 2
-            let waveform = sin(angle * 3 + phase) * 0.52
-                + sin(angle * 5 - phase * 1.28) * 0.30
-                + sin(angle * 7 + phase * 0.72) * 0.18
-            let radius = baseRadius * (1 + amplitude * CGFloat(waveform))
-            points.append(
-                CGPoint(
-                    x: center.x + CGFloat(cos(angle)) * radius,
-                    y: center.y + CGFloat(sin(angle)) * radius
-                )
-            )
-        }
-
-        var path = Path()
-        guard let first = points.first else { return path }
-        path.move(to: first)
-        for point in points.dropFirst() { path.addLine(to: point) }
-        path.closeSubpath()
-        return path
     }
 }
 
