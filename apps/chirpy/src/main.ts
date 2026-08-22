@@ -292,6 +292,46 @@ const session = new VoiceSession();
 // immediately overridden by pollStatus.
 let micMuted = false;
 
+// ---- Startup loading sequence -------------------------------------------
+const LOADING_ORDER = ["livekit", "agent", "stt", "tts", "llm"];
+const LOADING_LABELS: Record<string, string> = {
+  livekit: "Connecting to LiveKit…",
+  agent: "Starting agent worker…",
+  stt: "Loading speech-to-text…",
+  tts: "Loading text-to-speech…",
+  llm: "Loading language model…",
+};
+let loadingIdx = 0;
+let loadingDone = false;
+let loadingTimer: number | null = null;
+
+function setLoadingStage(idx: number) {
+  loadingIdx = Math.max(loadingIdx, Math.min(idx, LOADING_ORDER.length - 1));
+  const el = document.getElementById("loading-stage");
+  if (el) el.textContent = LOADING_LABELS[LOADING_ORDER[loadingIdx]] || "";
+  const list = document.getElementById("loading-stages");
+  if (list) {
+    list.querySelectorAll("li").forEach((li) => {
+      const s = li.getAttribute("data-stage");
+      const i = LOADING_ORDER.indexOf(s || "");
+      li.classList.toggle("active", i === loadingIdx);
+      li.classList.toggle("done", i >= 0 && i < loadingIdx);
+    });
+  }
+}
+
+function finishLoading() {
+  loadingDone = true;
+  if (loadingTimer !== null) {
+    window.clearInterval(loadingTimer);
+    loadingTimer = null;
+  }
+  const el = document.getElementById("loading-overlay");
+  if (el) el.hidden = true;
+  const dbg = document.getElementById("loading-panel");
+  if (dbg) dbg.hidden = true;
+}
+
 // ---------------------------------------------------------------------------
 // UI helpers
 // ---------------------------------------------------------------------------
@@ -330,6 +370,11 @@ function renderOrb() {
       </div>
       <div class="caption" id="transcript"></div>
       <div class="caption reply" id="reply"></div>
+      <div class="loading-overlay" id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-title">Starting Chirpy…</div>
+        <div class="loading-stage" id="loading-stage">Connecting to LiveKit…</div>
+      </div>
       <div class="controls top-right">
         <button id="debug" title="Open debug mode">${ICONS.debug}</button>
         <button id="quit" title="Quit Chirpy">${ICONS.quit}</button>
@@ -393,6 +438,17 @@ const messages: ChatMessage[] = [];
 function renderDebug() {
   root.innerHTML = `
     <div class="debug">
+      <div class="loading-panel" id="loading-panel">
+        <div class="loading-spinner"></div>
+        <div class="loading-title">Starting Chirpy…</div>
+        <ul class="loading-stages" id="loading-stages">
+          <li data-stage="livekit">Connect to LiveKit server</li>
+          <li data-stage="agent">Start agent worker</li>
+          <li data-stage="stt">Load speech-to-text (STT)</li>
+          <li data-stage="tts">Load text-to-speech (TTS)</li>
+          <li data-stage="llm">Load language model (LLM)</li>
+        </ul>
+      </div>
       <header>
         <div class="brand">Chirpy <span class="badge">debug</span></div>
         <span class="status-dot" id="status-dot"></span>
@@ -1004,6 +1060,29 @@ async function pollStatus() {
       dot?.classList.add("warn");
     }
   }
+  // Drive the startup loading sequence from real backend state.
+  if (!loadingDone) {
+    if (!status.livekit_running) {
+      setLoadingStage(0);
+    } else if (!status.agent_running) {
+      setLoadingStage(1);
+    } else {
+      // Agent is up; models (STT/TTS/LLM) finish loading over the next moments.
+      setLoadingStage(2);
+      if (loadingTimer === null) {
+        let i = 2;
+        loadingTimer = window.setInterval(() => {
+          if (loadingDone) return;
+          i++;
+          if (i >= LOADING_ORDER.length) {
+            finishLoading();
+            return;
+          }
+          setLoadingStage(i);
+        }, 1500);
+      }
+    }
+  }
   // Only the main window drives the voice session; the debug window just
   // observes status and the conversation via events. Don't auto-start if the
   // user explicitly muted the mic.
@@ -1060,7 +1139,10 @@ async function init() {
       }
       updateLastAssistant(e.payload as string);
     });
-    listen("conversation-assistant-end", () => finishLastAssistant());
+    listen("conversation-assistant-end", () => {
+      finishLastAssistant();
+      finishLoading();
+    });
     listen("conversation-latency", (e) => {
       addLatencySample(e.payload as LatencySample);
     });
@@ -1093,7 +1175,10 @@ async function init() {
     session.onUserMessage = (text) => emit("conversation-user", text);
     session.onUserPartial = (text) => emit("conversation-user-partial", text);
     session.onAssistantDelta = (delta) => emit("conversation-assistant-delta", delta);
-    session.onAssistantEnd = () => emit("conversation-assistant-end", null);
+    session.onAssistantEnd = () => {
+      emit("conversation-assistant-end", null);
+      finishLoading();
+    };
     session.onLatency = (payload) => emit("conversation-latency", payload);
     setInterval(pollStatus, 1000);
   }
