@@ -7,6 +7,7 @@
 **/target/
 **/dist/
 config/local.env
+config/barge-in.json
 logs/
 *.app/
 engine/chirpy/.models/

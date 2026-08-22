@@ -1,0 +1,15 @@
+{
+  "_comment": "Live barge-in overrides. Copy to config/barge-in.json to use. The worker watches this file and applies changes WITHOUT a restart: endpointing applies immediately; interruption options take effect on the next room/restart. Every value is optional and overrides the same-named key from config/local.env.",
+  "BARGE_IN": true,
+  "INTERRUPTION_MODE": "vad",
+  "BARGE_IN_MIN_DURATION": 0.5,
+  "BARGE_IN_MIN_WORDS": 0,
+  "BARGE_IN_FALSE_TIMEOUT": 2.0,
+  "BARGE_IN_BACKCHANNEL": "auto",
+  "BARGE_IN_RESUME_FALSE": true,
+  "BARGE_IN_DISCARD_AUDIO": true,
+  "AEC_WARMUP_DURATION": 3.0,
+  "ECHO_OVERLAP_THRESHOLD": 0.6,
+  "ENDPOINTING_MIN_DELAY": 0.7,
+  "ENDPOINTING_MAX_DELAY": 2.0
+}
