@@ -117,9 +117,9 @@ class KokoroChunkedStream(tts.ChunkedStream):
         loop = asyncio.get_running_loop()
         tts_obj = self._tts
 
-        def synthesize_blocking() -> list[bytes]:
+        def synthesize_blocking() -> bytes:
             pipeline = tts_obj._ensure_pipeline()
-            chunks: list[bytes] = []
+            parts: list[np.ndarray] = []
             for result in pipeline(
                 self._input_text,
                 voice=tts_obj._voice,
@@ -129,10 +129,72 @@ class KokoroChunkedStream(tts.ChunkedStream):
                     continue
                 audio = result.audio.detach().cpu().numpy()
                 pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-                chunks.append(pcm16.tobytes())
-            return chunks
+                parts.append(pcm16)
+            if not parts:
+                return b""
+            full = np.concatenate(parts)
+            trimmed = _trim_and_cap_silence(full, SAMPLE_RATE)
+            return trimmed.tobytes()
 
-        chunks = await loop.run_in_executor(None, synthesize_blocking)
-        for chunk in chunks:
-            output_emitter.push(chunk)
+        # Synthesize the whole reply, trim dead air, and push it as one
+        # continuous buffer. Pushing Kokoro's per-sentence chunks separately
+        # left 200ms+ of silence between sentences and 800ms on each end, which
+        # played back as "pausing and unpausing."
+        data = await loop.run_in_executor(None, synthesize_blocking)
+        if data:
+            output_emitter.push(data)
         output_emitter.flush()
+
+
+def _trim_and_cap_silence(
+    pcm: np.ndarray,
+    sample_rate: int,
+    frame_ms: int = 10,
+    threshold: float = 150.0,
+    max_silence_ms: int = 120,
+) -> np.ndarray:
+    """Trim leading/trailing near-silence and cap internal silence runs.
+
+    Kokoro adds ~800ms of padding on each end and ~200ms+ between sentences,
+    which plays back as an audible stop/start. This removes the dead air at the
+    start/end and trims internal silent runs down to ``max_silence_ms`` so the
+    reply flows continuously.
+    """
+    if pcm.size == 0:
+        return pcm
+    frame_len = max(1, int(sample_rate * frame_ms / 1000))
+    n = pcm.size
+    nframes = (n + frame_len - 1) // frame_len
+    padded = np.zeros(nframes * frame_len, dtype=pcm.dtype)
+    padded[:n] = pcm
+    frames = padded.reshape(nframes, frame_len).astype(np.float32)
+    rms = np.sqrt((frames * frames).mean(axis=1))
+    active = rms >= threshold
+    if not active.any():
+        return pcm
+
+    start_frame = int(np.argmax(active))
+    end_frame = int(nframes - np.argmax(active[::-1]))
+    max_frames = max(1, int(max_silence_ms / frame_ms))
+
+    # Mark frames to keep: everything in [start,end) except the excess of any
+    # internal silence run longer than max_frames.
+    keep = np.ones(end_frame, dtype=bool)
+    i = start_frame
+    while i < end_frame:
+        if not active[i]:
+            j = i
+            while j < end_frame and not active[j]:
+                j += 1
+            if j - i > max_frames:
+                keep[i + max_frames : j] = False
+            i = j
+        else:
+            i += 1
+
+    kept = [padded[f * frame_len : (f + 1) * frame_len] for f in range(start_frame, end_frame) if keep[f]]
+    if not kept:
+        return pcm
+    out = np.concatenate(kept)
+    # Drop any trailing padding zeros we introduced by frame-alignment.
+    return out.astype(pcm.dtype)
