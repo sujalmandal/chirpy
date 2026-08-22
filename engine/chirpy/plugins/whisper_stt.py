@@ -11,6 +11,9 @@ emitted when the segment ends.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
+import time
 
 import numpy as np
 
@@ -26,6 +29,8 @@ from livekit.agents.stt import (
 from livekit.plugins import silero
 
 from faster_whisper import WhisperModel
+
+logger = logging.getLogger("chirpy.whisper_stt")
 
 SAMPLE_RATE = 16_000
 # Re-transcribe the in-progress segment roughly this often to refresh the
@@ -67,17 +72,39 @@ class WhisperSTT(stt.STT):
         self._model: WhisperModel | None = None
         self._vad: agent_vad.VAD | None = None
         self._vad_lock = asyncio.Lock()
+        self._reload_lock = threading.Lock()
 
     def prewarm(self):
         self._ensure_model()
 
+    def reload(self, model_size: str | None = None, language: str | None = None) -> None:
+        """Hot-reload the model size and/or transcription language in place,
+        without replacing the STT plugin (used by the live STT config watcher).
+
+        The language applies immediately; a changed model size reloads the
+        faster-whisper model (downloading it on first use, then cached).
+        """
+        with self._reload_lock:
+            if language is not None:
+                self._language = language
+            if model_size is not None and model_size != self._model_size:
+                self._model_size = model_size
+                self._model = WhisperModel(
+                    self._model_size,
+                    device=self._device,
+                    compute_type=self._compute_type,
+                )
+                logger.info("STT model reloaded -> %s", self._model_size)
+
     def _ensure_model(self) -> WhisperModel:
         if self._model is None:
-            self._model = WhisperModel(
-                self._model_size,
-                device=self._device,
-                compute_type=self._compute_type,
-            )
+            with self._reload_lock:
+                if self._model is None:
+                    self._model = WhisperModel(
+                        self._model_size,
+                        device=self._device,
+                        compute_type=self._compute_type,
+                    )
         return self._model
 
     async def _ensure_vad(self) -> agent_vad.VAD:

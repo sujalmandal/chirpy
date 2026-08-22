@@ -110,6 +110,27 @@ Debug Mode is the operational view for the assistant. It includes:
 - Backend status and local system metrics
 - LiveKit server and agent worker logs
 - LLM and agent configuration
+- A **model picker** for STT and TTS
+
+### Model picker
+
+The **Models** button in the debug window lets you switch the local speech models
+and pre-download new ones:
+
+- **STT (faster-whisper)** — pick a size (`tiny`–`large-v3`) or type a custom
+  Hugging Face repo id (e.g. `Systran/faster-whisper-small`), plus the
+  transcription language.
+- **TTS (Kokoro)** — pick a voice (e.g. `af_heart`, `am_michael`) or type a
+  custom voice id, plus the language code.
+- **Browse Hugging Face** opens the right Hugging Face search in your browser
+  (faster-whisper / Kokoro tags).
+- **Download** pre-fetches the model/voice into the local Hugging Face cache, so
+  switching is fast.
+- **Apply (live)** — both STT and TTS apply **hot, without a restart**. The
+  worker watches `config/stt.json` and `config/tts.json` and swaps the model /
+  voice / language on the running session; TTS pre-caches the voice checkpoint
+  and STT reloads the model in the background so it's seamless. Language options
+  are shown as full names.
 
 Log files are written to:
 

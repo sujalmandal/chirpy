@@ -509,6 +509,153 @@ button {
   filter: brightness(1.1);
 }
 
+/* ---- Model picker modal ---- */
+.modal-box select {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-2);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.model-group {
+  border-top: 1px solid var(--border-2);
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.model-group h3 {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.model-group .tag {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  color: var(--muted);
+}
+
+.model-group .hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.model-group .hint code {
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 5px;
+  font-family: ui-monospace, monospace;
+}
+
+.model-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.model-actions button {
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-2);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.model-actions button svg {
+  opacity: 0.7;
+}
+
+.model-actions button:hover {
+  filter: brightness(1.1);
+}
+
+.model-actions button.ghost {
+  background: transparent;
+  border-color: var(--border-2);
+}
+
+.model-actions button:last-child {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.m-status {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 16px;
+}
+
+.mp-head h2 {
+  margin: 0;
+}
+
+.mp-sub {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.model-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+  filter: none;
+}
+
+/* Download progress bar */
+.download-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.progress {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+
+.progress-fill.error {
+  background: #e5484d;
+}
+
+.progress-pct {
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 34px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Scrollbars */
 ::-webkit-scrollbar {
   width: 8px;

@@ -8,7 +8,7 @@ use livekit_api::access_token::{AccessToken, VideoGrants};
 use livekit_api::services::LiveKitApi;
 use livekit_protocol as proto;
 use serde::Serialize;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const LIVEKIT_URL: &str = "ws://127.0.0.1:7880";
 const LIVEKIT_API_KEY: &str = "devkey";
@@ -314,6 +314,122 @@ fn open_logs() -> Result<(), String> {
     Ok(())
 }
 
+/// Hot-apply an STT model/language change by writing config/stt.json; the agent
+/// worker watches the file and swaps the model live (no restart).
+#[tauri::command]
+fn set_stt(model: String, language: String) -> Result<(), String> {
+    let path = project_root().join("config/stt.json");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let value = serde_json::json!({ "model": model, "language": language });
+    let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("could not write stt config: {e}"))
+}
+
+/// Hot-apply a TTS voice change by writing config/tts.json; the agent worker
+/// watches the file and swaps the voice live (no restart).
+#[tauri::command]
+fn set_tts(voice: String, lang: String) -> Result<(), String> {
+    let path = project_root().join("config/tts.json");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let value = serde_json::json!({ "voice": voice, "lang": lang });
+    let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("could not write tts config: {e}"))
+}
+
+/// Open a URL in the default browser (used by the model picker to browse
+/// Hugging Face with the right tag).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("could not open {url}: {e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("could not open {url}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Pre-download a local speech model (STT or TTS) via the engine's Python
+/// helper, so switching models in the picker is fast on first use. Streams
+/// ``progress <frac>`` lines from the helper as ``download-progress`` events.
+#[derive(Serialize, Clone)]
+struct DownloadProgress {
+    kind: String,
+    pct: f32,
+}
+
+#[tauri::command]
+async fn download_model(app: tauri::AppHandle, kind: String, id: String) -> Result<String, String> {
+    let (venv, _script) = engine_paths();
+    let script = project_root().join("engine/chirpy/download.py");
+    if !venv.exists() {
+        return Err("Chirpy engine is not set up. Run scripts/setup.sh first.".into());
+    }
+    if !script.exists() {
+        return Err("model download helper not found (engine/chirpy/download.py)".into());
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::{BufRead, BufReader, Read};
+
+        let mut child = Command::new(&venv)
+            .arg(&script)
+            .arg(&kind)
+            .arg(&id)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run download: {e}"))?;
+
+        if let Some(stdout) = child.stdout.take() {
+            let app = app.clone();
+            let kind = kind.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { continue };
+                    if let Some(frac) = line.trim().strip_prefix("progress ") {
+                        if let Ok(pct) = frac.parse::<f32>() {
+                            let _ = app.emit(
+                                "download-progress",
+                                DownloadProgress { kind: kind.clone(), pct },
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        let status = child.wait().map_err(|e| e.to_string())?;
+        let err_msg = match child.stderr.take() {
+            Some(mut stderr) => {
+                let mut s = String::new();
+                let _ = stderr.read_to_string(&mut s);
+                s.trim().to_string()
+            }
+            None => String::new(),
+        };
+        if status.success() {
+            Ok(format!("cached {kind} from {id}"))
+        } else {
+            Err(if err_msg.is_empty() { "download failed".to_string() } else { err_msg })
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -332,7 +448,11 @@ pub fn run() {
             keychain_set,
             keychain_delete,
             open_debug,
-            open_logs
+            open_logs,
+            open_url,
+            download_model,
+            set_tts,
+            set_stt
         ])
         .setup(|app| {
             let _ = app;

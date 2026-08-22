@@ -8,6 +8,8 @@
 **/dist/
 config/local.env
 config/barge-in.json
+config/tts.json
+config/stt.json
 logs/
 *.app/
 engine/chirpy/.models/

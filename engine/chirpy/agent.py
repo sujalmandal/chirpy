@@ -46,6 +46,12 @@ CONFIG = ROOT / "config" / "local.env"
 # without a restart (endpointing live, interruption on the next room/restart).
 RUNTIME_BARGEIN = ROOT / "config" / "barge-in.json"
 
+# Live TTS overrides; the worker watches this file and hot-swaps the voice
+# without a restart (the debug UI writes it via the `set_tts` command).
+RUNTIME_TTS = ROOT / "config" / "tts.json"
+# Live STT overrides (model size / language), applied without a restart.
+RUNTIME_STT = ROOT / "config" / "stt.json"
+
 # Default assistant system prompt tuned for natural, spoken conversation.
 DEFAULT_SYSTEM_PROMPT = (
     "You are Chirpy, a warm and natural voice assistant. Sound like a friendly "
@@ -239,6 +245,17 @@ async def entrypoint(ctx: JobContext):
     asyncio.create_task(watcher.run())
 
     await session.generate_reply(instructions="Greet the user briefly.")
+
+    # Hot TTS/STT reload: watch config/tts.json and config/stt.json and apply
+    # changes live without a restart.
+    import tts_watch
+
+    tts_watch.ConfigWatcher(
+        RUNTIME_TTS, lambda data: tts_watch.apply_tts_live(session._tts, data)
+    ).start()
+    tts_watch.ConfigWatcher(
+        RUNTIME_STT, lambda data: tts_watch.apply_stt_live(session._stt, data)
+    ).start()
 
 
 if __name__ == "__main__":
