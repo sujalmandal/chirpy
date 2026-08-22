@@ -310,7 +310,9 @@ async def entrypoint(ctx: JobContext):
     )
     asyncio.create_task(watcher.run())
 
-    await session.generate_reply(instructions="Greet the user briefly.")
+    # Speak a fixed greeting through TTS (no LLM dependency) so it reliably
+    # fires even when heavy mic audio (e.g. ambient noise) is saturating the STT.
+    await session.say("Hello! How can I assist you today?")
 
     # Hot TTS/STT reload: watch config/tts.json and config/stt.json and apply
     # changes live without a restart.
