@@ -12,40 +12,51 @@ import time
 import numpy as np
 import torch
 
-from livekit import rtc
 from livekit.agents import APIConnectOptions, tts
 
 from kokoro import KPipeline
+
+from aec import feed_reference
 
 logger = logging.getLogger("chirpy.kokoro_tts")
 
 SAMPLE_RATE = 24_000
 
 
-def _send_native(data: bytes) -> None:
-    """Stream TTS PCM to the app's native (non-WebRTC) audio output."""
-    port = os.environ.get("CHIRPY_NATIVE_AUDIO_PORT")
-    if not port:
-        return
-    try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=1.0) as s:
-            s.sendall(data)
-    except Exception:  # native audio unavailable; fall back to silence/room
-        pass
+class _NativeStream:
+    """A single persistent TCP connection to the app's native audio output.
 
+    Reconnecting per chunk is far too slow for real-time streaming, so one
+    connection is opened for the whole utterance and kept until it is done.
+    """
 
-def _feed_reference(apm, pcm: np.ndarray, sample_rate: int) -> None:
-    """Feed TTS audio to the AEC module as the echo-cancellation reference."""
-    spf = sample_rate * 10 // 1000  # 10 ms frames (WebRTC AEC requirement)
-    n = (pcm.size // spf) * spf
-    for block in pcm[:n].reshape(-1, spf):
-        sub = rtc.AudioFrame(
-            data=(np.clip(block, -1, 1) * 32767).astype(np.int16).tobytes(),
-            sample_rate=sample_rate,
-            num_channels=1,
-            samples_per_channel=spf,
-        )
-        apm.process_reverse_stream(sub)
+    def __init__(self, port: str | None):
+        self._s: socket.socket | None = None
+        self._port = port
+
+    def open(self) -> None:
+        if not self._port:
+            return
+        try:
+            self._s = socket.create_connection(("127.0.0.1", int(self._port)), timeout=2.0)
+        except Exception:  # native audio unavailable; fall back to the room only
+            self._s = None
+
+    def send(self, data: bytes) -> None:
+        if self._s is None:
+            return
+        try:
+            self._s.sendall(data)
+        except Exception:
+            self.close()
+
+    def close(self) -> None:
+        if self._s is not None:
+            try:
+                self._s.close()
+            except Exception:
+                pass
+            self._s = None
 
 
 class KokoroTTS(tts.TTS):
@@ -178,16 +189,57 @@ class KokoroChunkedStream(tts.ChunkedStream):
         tts_obj.latency_cb("tts", "start")
         data = await loop.run_in_executor(None, synthesize_blocking)
         tts_obj.latency_cb("tts", "done")
-        if data:
-            # Feed the audio to the AEC as the echo-cancellation reference.
-            if tts_obj.apm is not None:
-                pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                _feed_reference(tts_obj.apm, pcm, SAMPLE_RATE)
-            # Play natively (bypassing the stutter-prone webview WebRTC path).
-            _send_native(data)
-            # Also publish to the room so the session's turn handling stays in
-            # sync (the webview no longer plays this track).
-            output_emitter.push(data)
+        if not data:
+            output_emitter.flush()
+            return
+
+        # ---- Server-side AEC reference, paced to playback --------------------
+        # The reply is sent to the native speaker, fed to the AEC as its
+        # far-end (echo) reference, and pushed to the LiveKit room all at the
+        # same real-time cadence. This is the load-bearing detail:
+        #
+        #   WebRTC's echo-cancellation delay estimator only searches a small,
+        #   bounded delay between the far-end (TTS reference) and the near-end
+        #   (mic). If the whole reply were fed to the AEC up front, the
+        #   reference would lead the mic by the entire utterance duration --
+        #   far beyond the estimator's range -- so it could never converge and
+        #   the agent would keep hearing its own voice. Streaming each 10 ms
+        #   block at the moment it is actually played keeps that lead bounded
+        #   to just the OS/speaker/acoustic latency, which the AEC can absorb.
+        #
+        # Pushing to the room at the same pace also keeps the session's turn
+        # state in sync: the "speaking" turn stays open for the full spoken
+        # duration, so the agent's own late-arriving echo can't be re-parsed
+        # as a fresh user utterance after the turn has ended.
+        native = _NativeStream(os.environ.get("CHIRPY_NATIVE_AUDIO_PORT"))
+        native.open()
+        frame_len = SAMPLE_RATE * 10 // 1000  # 160 samples == 10 ms
+        pcm = np.frombuffer(data, dtype=np.int16)
+        total = pcm.size
+        start = time.perf_counter()
+        cursor = 0
+        try:
+            while cursor < total:
+                block = pcm[cursor : cursor + frame_len]
+                if block.size == 0:
+                    break
+                b16 = block.astype(np.int16)
+                # Far-end reference for the AEC, exactly the audio being played.
+                if tts_obj.apm is not None:
+                    feed_reference(tts_obj.apm, b16.astype(np.float32) / 32768.0, SAMPLE_RATE)
+                # Play natively (bypassing the stutter-prone webview WebRTC path).
+                native.send(b16.tobytes())
+                # Keep the live room track in sync with real-time playback.
+                output_emitter.push(b16.tobytes())
+                cursor += frame_len
+                # Pace to wall-clock: if we catch up (CPU kept up with real
+                # time), sleep until this block would have been played.
+                target = start + cursor / SAMPLE_RATE
+                delay = target - time.perf_counter()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        finally:
+            native.close()
         output_emitter.flush()
 
 

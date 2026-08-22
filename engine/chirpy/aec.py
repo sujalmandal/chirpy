@@ -12,12 +12,21 @@ the 50 ms audio frames to and from the module. The TTS plugin feeds the reverse
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from livekit import rtc
 
 # WebRTC APM works on exactly 10 ms frames.
 _AEC_FRAME_MS = 10
+
+# The mic FrameProcessor (near-end) and the TTS plugin (far-end / reference)
+# call into the same :class:`rtc.AudioProcessingModule` from different threads
+# (LiveKit's audio processing thread and the agent's asyncio event loop). The
+# module is not documented thread-safe for concurrent calls, so all APM access
+# is serialized through one process-wide lock.
+_APM_LOCK = threading.Lock()
 
 
 def _samples_per_frame(sample_rate: int) -> int:
@@ -64,16 +73,17 @@ class AECFilter(rtc.FrameProcessor[rtc.AudioFrame]):
         self._carry = pcm[keep:] if pcm.size > keep else None
         blocks = pcm[:keep].reshape(n_blocks, spf, ch)
         out = np.zeros(0, dtype=np.int16)
-        for block in blocks:
-            mono = block.reshape(-1) if ch == 1 else block
-            sub = rtc.AudioFrame(
-                data=_to_pcm16(mono).astype(np.int16).tobytes(),
-                sample_rate=frame.sample_rate,
-                num_channels=1 if ch == 1 else ch,
-                samples_per_channel=spf,
-            )
-            self._apm.process_stream(sub)  # modifies sub.data in place
-            out = np.concatenate([out, np.frombuffer(sub.data, dtype=np.int16)])
+        with _APM_LOCK:
+            for block in blocks:
+                mono = block.reshape(-1) if ch == 1 else block
+                sub = rtc.AudioFrame(
+                    data=_to_pcm16(mono).astype(np.int16).tobytes(),
+                    sample_rate=frame.sample_rate,
+                    num_channels=1 if ch == 1 else ch,
+                    samples_per_channel=spf,
+                )
+                self._apm.process_stream(sub)  # modifies sub.data in place
+                out = np.concatenate([out, np.frombuffer(sub.data, dtype=np.int16)])
         return rtc.AudioFrame(
             data=out.tobytes(),
             sample_rate=frame.sample_rate,
@@ -90,11 +100,12 @@ def feed_reference(apm: rtc.AudioProcessingModule, pcm: np.ndarray, sample_rate:
     pcm = np.asarray(pcm, dtype=np.float32)
     spf = _samples_per_frame(sample_rate)
     n = (pcm.size // spf) * spf
-    for block in pcm[:n].reshape(-1, spf):
-        sub = rtc.AudioFrame(
-            data=_to_pcm16(block).astype(np.int16).tobytes(),
-            sample_rate=sample_rate,
-            num_channels=1,
-            samples_per_channel=spf,
-        )
-        apm.process_reverse_stream(sub)
+    with _APM_LOCK:
+        for block in pcm[:n].reshape(-1, spf):
+            sub = rtc.AudioFrame(
+                data=_to_pcm16(block).astype(np.int16).tobytes(),
+                sample_rate=sample_rate,
+                num_channels=1,
+                samples_per_channel=spf,
+            )
+            apm.process_reverse_stream(sub)
