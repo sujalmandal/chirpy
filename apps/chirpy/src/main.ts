@@ -122,7 +122,8 @@ class VoiceSession {
   private listening = false;
   private speaking = false;
   private outputMuted = false;
-  private playbackEls: HTMLAudioElement[] = [];
+  private playbackSources: MediaStreamAudioSourceNode[] = [];
+  private playbackGains: GainNode[] = [];
   private reply = "";
   private transcript = "";
 
@@ -176,7 +177,7 @@ class VoiceSession {
 
       await room.connect(LIVEKIT_URL, token);
       await room.localParticipant.setMicrophoneEnabled(true);
-      this.audioCtx = new AudioContext({ latencyHint: "interactive" });
+      this.audioCtx = new AudioContext({ latencyHint: "playback" });
       await this.audioCtx.resume();
       // Ensure the agent worker is dispatched into this room. The worker may
       // still be starting up, so retry until the agent actually joins the room
@@ -210,8 +211,10 @@ class VoiceSession {
     this.onSpeaking(false);
     this.room?.disconnect();
     this.room = null;
-    this.playbackEls.forEach((el) => el.remove());
-    this.playbackEls = [];
+    this.playbackSources.forEach((n) => n.disconnect());
+    this.playbackGains.forEach((n) => n.disconnect());
+    this.playbackSources = [];
+    this.playbackGains = [];
     this.audioCtx?.close();
     this.audioCtx = null;
     this.onStatus("Conversation stopped");
@@ -219,7 +222,7 @@ class VoiceSession {
 
   toggleOutputMuted() {
     this.outputMuted = !this.outputMuted;
-    this.playbackEls.forEach((el) => (el.muted = this.outputMuted));
+    this.playbackGains.forEach((g) => (g.gain.value = this.outputMuted ? 0 : 1));
     if (this.room) {
       this.room.remoteParticipants.forEach((p) => {
         p.audioTrackPublications.forEach((pub) => pub.setSubscribed(!this.outputMuted));
@@ -235,18 +238,19 @@ class VoiceSession {
   }
 
   private attachPlayback(track: Track) {
-    // Play the agent's audio through an <audio> element. This is required for
-    // WebKit's echo canceller: only a playing <audio> element's output is used
-    // as the AEC reference, so it can cancel the agent's voice from the mic and
-    // prevent the agent from hearing itself and triggering bogus barge-in.
-    // (AudioContext.destination output is NOT included in WebKit's AEC.)
-    const el = document.createElement("audio");
-    el.srcObject = new MediaStream([track.mediaStreamTrack]);
-    el.autoplay = true;
-    el.muted = this.outputMuted;
-    el.style.display = "none";
-    document.body.appendChild(el);
-    this.playbackEls.push(el);
+    // Play the agent's audio through the Web Audio graph, which buffers
+    // smoothly on live streams (a bare <audio> element underruns/stutters).
+    // Echo cancellation of the agent's own voice is handled server-side by the
+    // engine (AudioProcessingModule AEC), so it still won't hear itself here.
+    const ctx = this.audioCtx;
+    if (!ctx) return;
+    const source = ctx.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+    const gain = ctx.createGain();
+    gain.gain.value = this.outputMuted ? 0 : 1;
+    source.connect(gain);
+    gain.connect(ctx.destination);
+    this.playbackSources.push(source);
+    this.playbackGains.push(gain);
   }
 
   private handleData(payload: Uint8Array) {

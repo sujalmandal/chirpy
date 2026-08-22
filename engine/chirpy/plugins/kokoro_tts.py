@@ -10,6 +10,7 @@ import time
 import numpy as np
 import torch
 
+from livekit import rtc
 from livekit.agents import APIConnectOptions, tts
 
 from kokoro import KPipeline
@@ -17,6 +18,20 @@ from kokoro import KPipeline
 logger = logging.getLogger("chirpy.kokoro_tts")
 
 SAMPLE_RATE = 24_000
+
+
+def _feed_reference(apm, pcm: np.ndarray, sample_rate: int) -> None:
+    """Feed TTS audio to the AEC module as the echo-cancellation reference."""
+    spf = sample_rate * 10 // 1000  # 10 ms frames (WebRTC AEC requirement)
+    n = (pcm.size // spf) * spf
+    for block in pcm[:n].reshape(-1, spf):
+        sub = rtc.AudioFrame(
+            data=(np.clip(block, -1, 1) * 32767).astype(np.int16).tobytes(),
+            sample_rate=sample_rate,
+            num_channels=1,
+            samples_per_channel=spf,
+        )
+        apm.process_reverse_stream(sub)
 
 
 class KokoroTTS(tts.TTS):
@@ -46,6 +61,9 @@ class KokoroTTS(tts.TTS):
         # Optional callback(stage, event, text="") wired to the latency tracker
         # by the agent so TTS timing reaches the debug UI.
         self.latency_cb = latency_cb or (lambda stage, event, text="": None)
+        # Optional AEC module wired by the agent; the synthesized audio is fed
+        # to it as the echo-cancellation reference (reverse stream).
+        self.apm = None
 
     def prewarm(self):
         self._ensure_pipeline()
@@ -152,7 +170,13 @@ class KokoroChunkedStream(tts.ChunkedStream):
             # jitter buffer instead of underrunning at every packet boundary.
             interval = 50 / 1000 * 0.8
             for i in range(0, len(data), chunk_bytes):
-                output_emitter.push(data[i : i + chunk_bytes])
+                chunk = data[i : i + chunk_bytes]
+                # Feed this audio to the AEC as the reference (reverse stream) so
+                # the server can cancel the agent's own voice from the mic.
+                if tts_obj.apm is not None:
+                    chunk_pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                    _feed_reference(tts_obj.apm, chunk_pcm, SAMPLE_RATE)
+                output_emitter.push(chunk)
                 await asyncio.sleep(interval)
         output_emitter.flush()
 

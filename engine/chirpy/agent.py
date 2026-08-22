@@ -24,7 +24,7 @@ from pathlib import Path
 
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, llm, room_io
-from livekit.plugins import dtln, openai
+from livekit.plugins import openai
 
 from bargein import (
     ConfigWatcher,
@@ -34,6 +34,7 @@ from bargein import (
     build_turn_handling,
     load_barge_in_policy,
 )
+from aec import AECFilter
 from echoguard import EchoGuard
 from latency import LatencyTracker
 from llm_fallback import FallbackLLM
@@ -275,15 +276,28 @@ async def entrypoint(ctx: JobContext):
     session._stt.latency_cb = lambda stage, event, text="": tracker.handle(stage, event, text)
     session._tts.latency_cb = lambda stage, event, text="": tracker.handle(stage, event, text)
 
+    # Server-side acoustic echo cancellation. The client plays the agent's TTS
+    # through Web Audio (smooth), which WebKit does not include in its browser
+    # AEC reference; without this the agent hears its own voice and triggers
+    # bogus barge-in. The TTS plugin feeds its output as the AEC reference.
+    _apm = rtc.AudioProcessingModule(
+        echo_cancellation=True,
+        noise_suppression=True,
+        high_pass_filter=True,
+    )
+    session._tts.apm = _apm
+    mic_aec = AECFilter(_apm)
+
     agent = Agent(instructions=system_prompt)
     _setup_transcript_bridge(ctx, session, guard, tracker)
     await session.start(
         agent=agent,
         room=ctx.room,
-        # DTLN noise suppression on the inbound mic audio (self-hosted, in-process).
+        # AEC + (DTLN-style) noise suppression on the inbound mic audio, so the
+        # agent doesn't hear its own voice and doesn't barge in on itself.
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                noise_cancellation=dtln.noise_suppression(),
+                noise_cancellation=mic_aec,
             ),
         ),
     )
