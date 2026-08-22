@@ -121,19 +121,28 @@ class VoiceSession {
   private audioCtx: AudioContext | null = null;
   private listening = false;
   private speaking = false;
-  private agentSpeaking = false;
   private outputMuted = false;
   private playbackSources: MediaStreamAudioSourceNode[] = [];
   private playbackGains: GainNode[] = [];
   private reply = "";
   private transcript = "";
+  // Live audio-level sampling for the debug waveforms. The local mic track and
+  // the agent's (remote) audio track feed Web Audio analysers; the timer reads
+  // their RMS and forwards it to the debug window.
+  private micTrack: Track | null = null;
+  private agentTrack: Track | null = null;
+  private micAnalyser: AnalyserNode | null = null;
+  private spkAnalyser: AnalyserNode | null = null;
+  private micSrc: MediaStreamAudioSourceNode | null = null;
+  private spkSrc: MediaStreamAudioSourceNode | null = null;
+  private audioLevelTimer: number | null = null;
 
   onStatus: (s: string) => void = () => {};
   onTranscript: (t: string, final?: boolean) => void = () => {};
   onReply: (t: string, final?: boolean) => void = () => {};
   onSpeaking: (b: boolean) => void = () => {};
-  onAgentSpeaking: (b: boolean) => void = () => {};
   onListening: (b: boolean) => void = () => {};
+  onAudioLevel: (mic: number, speaker: number) => void = () => {};
   onUserMessage: (text: string) => void = () => {};
   onUserPartial: (text: string) => void = () => {};
   onAssistantStart: () => void = () => {};
@@ -146,9 +155,6 @@ class VoiceSession {
   }
   get isSpeaking() {
     return this.speaking;
-  }
-  get isAgentSpeaking() {
-    return this.agentSpeaking;
   }
   get isOutputMuted() {
     return this.outputMuted;
@@ -165,19 +171,21 @@ class VoiceSession {
       this.room = room;
 
       room
-        .on(RoomEvent.TrackSubscribed, (track) => {
-          if (track.kind === Track.Kind.Audio) this.attachPlayback(track);
+        .on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+          if (track.kind === Track.Kind.Audio) {
+            // Remember the agent's audio track so we can sample its level for the
+            // debug speaker waveform.
+            if (participant?.identity.startsWith("agent-")) {
+              this.agentTrack = track;
+              this.setupAnalyser("spk");
+            }
+            this.attachPlayback(track);
+          }
         })
         .on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
           const speaking = speakers.length > 0;
           this.speaking = speaking;
           this.onSpeaking(speaking);
-          // Speaker-output indicator: the agent is actively producing audio only
-          // when the agent participant itself is an active speaker (the user
-          // talking also moves the general "speaking" flag, but not this one).
-          const agentSpeaking = speakers.some((p) => p.identity.startsWith("agent-"));
-          this.agentSpeaking = agentSpeaking;
-          this.onAgentSpeaking(agentSpeaking);
         })
         .on(RoomEvent.DataReceived, (payload) => {
           this.handleData(payload);
@@ -207,6 +215,15 @@ class VoiceSession {
         }
         if (this.agentInRoom(room)) break;
       }
+      // Start sampling the mic and agent audio levels for the debug waveforms.
+      this.micTrack =
+        room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track ?? null;
+      this.setupAnalyser("mic");
+      if (this.audioLevelTimer === null) {
+        this.audioLevelTimer = window.setInterval(() => {
+          this.onAudioLevel(this.readLevel(this.micAnalyser), this.readLevel(this.spkAnalyser));
+        }, 100);
+      }
       this.onStatus("Listening — speak naturally");
     } catch (e) {
       this.onStatus(`Could not connect: ${(e as Error).message}`);
@@ -222,6 +239,19 @@ class VoiceSession {
     this.onSpeaking(false);
     this.room?.disconnect();
     this.room = null;
+    this.micTrack = null;
+    this.agentTrack = null;
+    this.micSrc?.disconnect();
+    this.spkSrc?.disconnect();
+    this.micSrc = null;
+    this.spkSrc = null;
+    this.micAnalyser = null;
+    this.spkAnalyser = null;
+    if (this.audioLevelTimer !== null) {
+      window.clearInterval(this.audioLevelTimer);
+      this.audioLevelTimer = null;
+    }
+    this.onAudioLevel(0, 0);
     this.playbackSources.forEach((n) => n.disconnect());
     this.playbackGains.forEach((n) => n.disconnect());
     this.playbackSources = [];
@@ -229,6 +259,40 @@ class VoiceSession {
     this.audioCtx?.close();
     this.audioCtx = null;
     this.onStatus("Conversation stopped");
+  }
+
+  // Route a track's audio into an AnalyserNode so we can read its level without
+  // connecting it to the output (playback is native; the mic must not loop back).
+  private setupAnalyser(kind: "mic" | "spk") {
+    if (!this.audioCtx) return;
+    const track = kind === "mic" ? this.micTrack : this.agentTrack;
+    if (!track) return;
+    const src = this.audioCtx.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+    const analyser = this.audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.4;
+    src.connect(analyser);
+    if (kind === "mic") {
+      this.micSrc = src;
+      this.micAnalyser = analyser;
+    } else {
+      this.spkSrc = src;
+      this.spkAnalyser = analyser;
+    }
+  }
+
+  // Normalized 0..1 RMS of an analyser's current window (0 when none present).
+  private readLevel(analyser: AnalyserNode | null): number {
+    if (!analyser) return 0;
+    const buf = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const v = (buf[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / buf.length);
+    return Math.min(1, rms * 3);
   }
 
   toggleOutputMuted() {
@@ -419,9 +483,51 @@ function renderOrb() {
   updateOrbControls();
 }
 
-function setIoIndicator(id: string, active: boolean) {
-  const el = document.getElementById(id);
-  if (el) el.classList.toggle("active", active);
+// Scrolling line waveform buffers for the debug mic/speaker readouts.
+const WAVE_LEN = 96;
+const micWave: number[] = [];
+const spkWave: number[] = [];
+
+function pushWave(buf: number[], v: number) {
+  buf.push(Math.max(0, Math.min(1, v)));
+  if (buf.length > WAVE_LEN) buf.shift();
+}
+
+function drawWave(canvasId: string, data: number[], color: string) {
+  const canvas = document.getElementById(canvasId) as HTMLCanvasElement | null;
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 120;
+  const cssH = canvas.clientHeight || 32;
+  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  // Center line.
+  ctx.beginPath();
+  ctx.moveTo(0, cssH / 2);
+  ctx.lineTo(cssW, cssH / 2);
+  ctx.strokeStyle = "rgba(128,140,160,0.25)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  // Waveform polyline, centered so 0 rides the midline and loudness pushes out.
+  if (data.length > 1) {
+    const amp = (cssH / 2) - 2;
+    ctx.beginPath();
+    for (let i = 0; i < data.length; i++) {
+      const x = (i / (WAVE_LEN - 1)) * cssW;
+      const y = cssH / 2 - data[i] * amp;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.75;
+    ctx.stroke();
+  }
 }
 
 // Reflect the live mic/speaker state in the under-orb buttons.
@@ -469,12 +575,12 @@ function renderDebug() {
         <div class="brand">Chirpy <span class="badge">debug</span></div>
         <span class="status-dot" id="status-dot"></span>
         <span id="status" class="status">Getting ready</span>
-        <span class="io-indicator" id="mic-ind" title="Mic listening">
-          ${ICONS.mic}<span>Mic</span>
-        </span>
-        <span class="io-indicator" id="speaker-ind" title="Speaker outputting">
-          ${ICONS.speaker}<span>Speaker</span>
-        </span>
+        <div class="wave" id="mic-wave-box" title="Mic audio level">
+          <canvas id="mic-wave"></canvas><span>Mic</span>
+        </div>
+        <div class="wave" id="speaker-wave-box" title="Speaker audio level">
+          <canvas id="speaker-wave"></canvas><span>Speaker</span>
+        </div>
         <span class="metrics" id="metrics"></span>
         <button id="settings" title="Configure agent & LLM">${ICONS.gear} Settings</button>
         <button id="models" title="Pick STT & TTS models">${ICONS.model} Models</button>
@@ -1178,10 +1284,15 @@ async function init() {
     listen("conversation-latency", (e) => {
       addLatencySample(e.payload as LatencySample);
     });
-    // Mic-listening / speaker-outputting indicators. The main window owns the
-    // live session and broadcasts these states; we only render them here.
-    listen("io-mic", (e) => setIoIndicator("mic-ind", e.payload === true));
-    listen("io-speaker", (e) => setIoIndicator("speaker-ind", e.payload === true));
+    // Mic / speaker line waveforms. The main window owns the LiveKit room and
+    // streams sampled audio levels (mic, speaker) here; we render scrolling lines.
+    listen("audio-level", (e) => {
+      const d = e.payload as { mic: number; speaker: number };
+      pushWave(micWave, d.mic);
+      pushWave(spkWave, d.speaker);
+      drawWave("mic-wave", micWave, "#2ee6a8");
+      drawWave("speaker-wave", spkWave, "#1adceb");
+    });
     session.onStatus = (s) => {
       const el = document.getElementById("status");
       if (el) el.textContent = s;
@@ -1206,9 +1317,10 @@ async function init() {
       const orb = document.getElementById("orb");
       if (orb) orb.classList.toggle("listening", b);
       updateOrbControls();
-      emit("io-mic", b);
     };
-    session.onAgentSpeaking = (b) => emit("io-speaker", b);
+    // Stream live mic/speaker audio levels to the debug window for its
+    // waveforms. The main window owns the LiveKit room, so it does the sampling.
+    session.onAudioLevel = (mic, speaker) => emit("audio-level", { mic, speaker });
     // Broadcast the conversation to the debug window.
     session.onUserMessage = (text) => emit("conversation-user", text);
     session.onUserPartial = (text) => emit("conversation-user-partial", text);
@@ -1227,13 +1339,6 @@ async function init() {
       await new Promise((r) => setTimeout(r, 1500));
       if (!micMuted) session.start();
     });
-    // Keep the debug view's mic/speaker indicators in sync even if the debug
-    // window opens after the session is already running (state-change events
-    // alone can miss the initial state).
-    setInterval(() => {
-      emit("io-mic", session.isListening);
-      emit("io-speaker", session.isAgentSpeaking);
-    }, 1000);
     setInterval(pollStatus, 1000);
   }
 }
