@@ -122,8 +122,7 @@ class VoiceSession {
   private listening = false;
   private speaking = false;
   private outputMuted = false;
-  private playbackSources: MediaStreamAudioSourceNode[] = [];
-  private playbackGains: GainNode[] = [];
+  private playbackEls: HTMLAudioElement[] = [];
   private reply = "";
   private transcript = "";
 
@@ -211,10 +210,8 @@ class VoiceSession {
     this.onSpeaking(false);
     this.room?.disconnect();
     this.room = null;
-    this.playbackSources.forEach((n) => n.disconnect());
-    this.playbackGains.forEach((n) => n.disconnect());
-    this.playbackSources = [];
-    this.playbackGains = [];
+    this.playbackEls.forEach((el) => el.remove());
+    this.playbackEls = [];
     this.audioCtx?.close();
     this.audioCtx = null;
     this.onStatus("Conversation stopped");
@@ -222,7 +219,7 @@ class VoiceSession {
 
   toggleOutputMuted() {
     this.outputMuted = !this.outputMuted;
-    this.playbackGains.forEach((g) => (g.gain.value = this.outputMuted ? 0 : 1));
+    this.playbackEls.forEach((el) => (el.muted = this.outputMuted));
     if (this.room) {
       this.room.remoteParticipants.forEach((p) => {
         p.audioTrackPublications.forEach((pub) => pub.setSubscribed(!this.outputMuted));
@@ -238,20 +235,18 @@ class VoiceSession {
   }
 
   private attachPlayback(track: Track) {
-    // Play the agent's audio through the Web Audio graph (AudioContext buffer)
-    // rather than a bare <audio> element, which underruns/stutters on live
-    // WebRTC MediaStreams. The AudioContext is created/resumed on a user gesture
-    // in start(), and its destination output is included in the browser's echo
-    // canceller reference, so the agent still shouldn't hear itself.
-    const ctx = this.audioCtx;
-    if (!ctx) return;
-    const source = ctx.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
-    const gain = ctx.createGain();
-    gain.gain.value = this.outputMuted ? 0 : 1;
-    source.connect(gain);
-    gain.connect(ctx.destination);
-    this.playbackSources.push(source);
-    this.playbackGains.push(gain);
+    // Play the agent's audio through an <audio> element (not Web Audio). The
+    // browser's echo canceller needs this rendered audio as a reference to
+    // cancel it from the microphone; routing playback through the Web Audio
+    // graph (AudioContext.destination) made the agent hear its own voice and
+    // reply to itself.
+    const el = document.createElement("audio");
+    el.srcObject = new MediaStream([track.mediaStreamTrack]);
+    el.autoplay = true;
+    el.muted = this.outputMuted;
+    el.style.display = "none";
+    document.body.appendChild(el);
+    this.playbackEls.push(el);
   }
 
   private handleData(payload: Uint8Array) {
