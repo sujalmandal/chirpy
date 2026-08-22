@@ -352,6 +352,35 @@ button {
   box-shadow: 0 0 8px rgba(255, 92, 92, 0.5);
 }
 
+.debug header .io-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.debug header .io-indicator svg {
+  flex-shrink: 0;
+}
+
+.debug header .io-indicator.active {
+  color: var(--text);
+  border-color: rgba(46, 230, 168, 0.5);
+  background: rgba(46, 230, 168, 0.12);
+}
+
+.debug header .io-indicator.active#speaker-ind {
+  border-color: rgba(26, 220, 235, 0.5);
+  background: rgba(26, 220, 235, 0.12);
+}
+
 .debug header .metrics {
   margin-left: auto;
   font-family: ui-monospace, monospace;

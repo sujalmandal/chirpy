@@ -299,10 +299,25 @@ fn keychain_delete(account: String) -> Result<(), String> {
 
 #[tauri::command]
 fn open_debug(app: tauri::AppHandle) -> Result<(), String> {
+    // Hide the orb (main) window so the debug screen is the only thing on
+    // screen. The orb comes back when the debug window is closed (handled in
+    // `run()`).
+    if let Some(main) = app.get_webview_window("main") {
+        main.hide().map_err(|e| e.to_string())?;
+    }
     if let Some(win) = app.get_webview_window("debug") {
         win.show().map_err(|e| e.to_string())?;
         win.set_focus().map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// Quit the app from the orb. The orb's close button is the app's only exit
+/// path, so this explicitly tears down the self-hosted backend via the
+/// `RunEvent::Exit` handler rather than relying on "last window closed".
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
     Ok(())
 }
 
@@ -467,6 +482,7 @@ pub fn run() {
             keychain_set,
             keychain_delete,
             open_debug,
+            quit_app,
             open_logs,
             open_url,
             download_model,
@@ -489,13 +505,28 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Chirpy");
 
-    app.run(|app_handle, event| {
+    app.run(|app_handle, event| match event {
+        // Closing the debug window returns to the orb: swallow the close and
+        // re-show the orb instead. The orb is the primary window, and its close
+        // button is the only way to actually quit the app.
+        tauri::RunEvent::WindowEvent { label, event, .. } if label == "debug" => {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                if let Some(win) = app_handle.get_webview_window("debug") {
+                    let _ = win.hide();
+                }
+                if let Some(main) = app_handle.get_webview_window("main") {
+                    let _ = main.show();
+                }
+            }
+        }
         // Tear down the self-hosted LiveKit server and the agent worker when the
         // app exits. Without this they leak as orphaned processes holding ports
         // 7880/7882, which breaks the next launch (a port-in-use failure).
-        if let tauri::RunEvent::Exit = event {
+        tauri::RunEvent::Exit => {
             let state = app_handle.state::<Mutex<BackendState>>();
             let _ = stop_backend(state);
         }
+        _ => {}
     });
 }

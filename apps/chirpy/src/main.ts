@@ -121,6 +121,7 @@ class VoiceSession {
   private audioCtx: AudioContext | null = null;
   private listening = false;
   private speaking = false;
+  private agentSpeaking = false;
   private outputMuted = false;
   private playbackSources: MediaStreamAudioSourceNode[] = [];
   private playbackGains: GainNode[] = [];
@@ -131,6 +132,7 @@ class VoiceSession {
   onTranscript: (t: string, final?: boolean) => void = () => {};
   onReply: (t: string, final?: boolean) => void = () => {};
   onSpeaking: (b: boolean) => void = () => {};
+  onAgentSpeaking: (b: boolean) => void = () => {};
   onListening: (b: boolean) => void = () => {};
   onUserMessage: (text: string) => void = () => {};
   onUserPartial: (text: string) => void = () => {};
@@ -144,6 +146,9 @@ class VoiceSession {
   }
   get isSpeaking() {
     return this.speaking;
+  }
+  get isAgentSpeaking() {
+    return this.agentSpeaking;
   }
   get isOutputMuted() {
     return this.outputMuted;
@@ -167,6 +172,12 @@ class VoiceSession {
           const speaking = speakers.length > 0;
           this.speaking = speaking;
           this.onSpeaking(speaking);
+          // Speaker-output indicator: the agent is actively producing audio only
+          // when the agent participant itself is an active speaker (the user
+          // talking also moves the general "speaking" flag, but not this one).
+          const agentSpeaking = speakers.some((p) => p.identity.startsWith("agent-"));
+          this.agentSpeaking = agentSpeaking;
+          this.onAgentSpeaking(agentSpeaking);
         })
         .on(RoomEvent.DataReceived, (payload) => {
           this.handleData(payload);
@@ -400,12 +411,17 @@ function renderOrb() {
     updateOrbControls();
   };
   document.getElementById("debug")!.onclick = () => invoke("open_debug");
-  document.getElementById("quit")!.onclick = () => getCurrentWindow().close();
+  document.getElementById("quit")!.onclick = () => invoke("quit_app");
   document.getElementById("orb-shell")!.addEventListener("mousedown", (e) => {
     if ((e.target as HTMLElement).closest("button")) return;
     getCurrentWindow().startDragging();
   });
   updateOrbControls();
+}
+
+function setIoIndicator(id: string, active: boolean) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle("active", active);
 }
 
 // Reflect the live mic/speaker state in the under-orb buttons.
@@ -453,6 +469,12 @@ function renderDebug() {
         <div class="brand">Chirpy <span class="badge">debug</span></div>
         <span class="status-dot" id="status-dot"></span>
         <span id="status" class="status">Getting ready</span>
+        <span class="io-indicator" id="mic-ind" title="Mic listening">
+          ${ICONS.mic}<span>Mic</span>
+        </span>
+        <span class="io-indicator" id="speaker-ind" title="Speaker outputting">
+          ${ICONS.speaker}<span>Speaker</span>
+        </span>
         <span class="metrics" id="metrics"></span>
         <button id="settings" title="Configure agent & LLM">${ICONS.gear} Settings</button>
         <button id="models" title="Pick STT & TTS models">${ICONS.model} Models</button>
@@ -509,7 +531,17 @@ function renderDebug() {
     </div>
   `;
   document.getElementById("restart")!.onclick = async () => {
-    await invoke("restart_backend", { config: engineEnvironment() });
+    const st = document.getElementById("status");
+    if (st) st.textContent = "Restarting engine…";
+    try {
+      await invoke("restart_backend", { config: engineEnvironment() });
+      // The backend processes have (re)started. Ask the main window, which owns
+      // the live voice session, to tear down and reconnect so it re-dispatches
+      // the agent into the room (restart_backend alone doesn't reconnect).
+      emit("app-restart");
+    } catch (e) {
+      if (st) st.textContent = `Restart failed: ${(e as Error).message}`;
+    }
   };
   document.getElementById("settings")!.onclick = () => openSettings();
   document.getElementById("models")!.onclick = () => openModelPicker();
@@ -1146,6 +1178,10 @@ async function init() {
     listen("conversation-latency", (e) => {
       addLatencySample(e.payload as LatencySample);
     });
+    // Mic-listening / speaker-outputting indicators. The main window owns the
+    // live session and broadcasts these states; we only render them here.
+    listen("io-mic", (e) => setIoIndicator("mic-ind", e.payload === true));
+    listen("io-speaker", (e) => setIoIndicator("speaker-ind", e.payload === true));
     session.onStatus = (s) => {
       const el = document.getElementById("status");
       if (el) el.textContent = s;
@@ -1170,7 +1206,9 @@ async function init() {
       const orb = document.getElementById("orb");
       if (orb) orb.classList.toggle("listening", b);
       updateOrbControls();
+      emit("io-mic", b);
     };
+    session.onAgentSpeaking = (b) => emit("io-speaker", b);
     // Broadcast the conversation to the debug window.
     session.onUserMessage = (text) => emit("conversation-user", text);
     session.onUserPartial = (text) => emit("conversation-user-partial", text);
@@ -1180,6 +1218,22 @@ async function init() {
       finishLoading();
     };
     session.onLatency = (payload) => emit("conversation-latency", payload);
+    // The debug window's "Restart" button restarts the backend then emits this
+    // event. Because the main window owns the live voice session, tear it down
+    // and rebuild it so it reconnects to the (new) agent worker and re-dispatches
+    // the agent into the room.
+    listen("app-restart", async () => {
+      session.stop();
+      await new Promise((r) => setTimeout(r, 1500));
+      if (!micMuted) session.start();
+    });
+    // Keep the debug view's mic/speaker indicators in sync even if the debug
+    // window opens after the session is already running (state-change events
+    // alone can miss the initial state).
+    setInterval(() => {
+      emit("io-mic", session.isListening);
+      emit("io-speaker", session.isAgentSpeaking);
+    }, 1000);
     setInterval(pollStatus, 1000);
   }
 }
