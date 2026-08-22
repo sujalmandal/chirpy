@@ -1,9 +1,9 @@
 #!/bin/zsh
 # One-time setup for the Chirpy voice engine: create the Python venv, install
-# dependencies (including all Kokoro language tokenizers), install the
-# self-hosted LiveKit server, pre-download every speech model (faster-whisper,
-# all Kokoro voices, TEN-VAD), and run a smoke test so STT + TTS are proven to
-# work on this Mac before you launch the app.
+# dependencies, install the self-hosted LiveKit server, pre-download the
+# lightest on-device models (tiny STT, the default Kokoro voice, TEN-VAD, and
+# the bundled Qwen LLM), and run a smoke test so STT + TTS are proven to work
+# on this Mac before you launch the app.
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,8 +37,9 @@ else
     echo "livekit-server already installed"
 fi
 
-echo "==> Downloading Japanese tokenizer dictionary (for Kokoro 'ja')"
-"$venv_python" -m unidic download
+# The Japanese tokenizer dictionary (UniDic, ~526 MB) is deliberately NOT
+# pre-downloaded here: it's only needed for Japanese TTS and would stall every
+# fresh install. Kokoro fetches it on demand if you switch to a Japanese voice.
 
 echo "==> Pre-downloading lightest speech models (tiny STT, default TTS voice, TEN-VAD)"
 "$venv_python" "$engine_dir/download.py" stt tiny
