@@ -36,6 +36,7 @@ from bargein import (
 )
 from echoguard import EchoGuard
 from latency import LatencyTracker
+from llm_fallback import FallbackLLM
 from plugins import KokoroTTS, WhisperSTT
 from vad import build_vad
 
@@ -108,16 +109,28 @@ def build_session(config: dict[str, str]) -> AgentSession:
             speed=float(config.get("TTS_SPEED", "1.0")),
         ),
         vad=build_vad(config),
-        llm=openai.LLM(
-            base_url=config.get("LLM_BASE_URL"),
-            model=config.get("LLM_MODEL_NAME"),
-            api_key=config.get("LLM_API_KEY") or "local",
-        ),
+        llm=_build_llm(config),
         turn_handling=build_turn_handling(policy),
         # Don't allow interruptions until acoustic echo cancellation converges,
         # so the agent's own startup audio can't trigger a bogus barge-in.
         aec_warmup_duration=policy.aec_warmup_duration,
     )
+
+
+def _build_llm(config: dict[str, str]) -> FallbackLLM:
+    """Build the LLM wrapped in a config-guidance fallback.
+
+    If the endpoint or model is missing, or the endpoint can't be reached, the
+    agent replies asking the user to configure their LLM rather than staying
+    silent (see :mod:`llm_fallback`).
+    """
+    base_url = (config.get("LLM_BASE_URL") or "").strip()
+    model = (config.get("LLM_MODEL_NAME") or "").strip()
+    api_key = config.get("LLM_API_KEY") or "local"
+    if not base_url or not model:
+        logger.warning("LLM not configured (missing endpoint or model); will reply with config guidance")
+        return FallbackLLM(None)
+    return FallbackLLM(openai.LLM(base_url=base_url, model=model, api_key=api_key))
 
 
 async def _publish(ctx: JobContext, payload: dict) -> None:

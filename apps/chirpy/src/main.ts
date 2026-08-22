@@ -419,7 +419,6 @@ function renderDebug() {
       <section class="latency-panel">
         <div class="panel-head">
           <h3>Latency</h3>
-          <span class="latency-head-msg" id="latency-msg">Waiting for a turn…</span>
           <button id="latency-clear" title="Clear latency graph">Clear</button>
         </div>
         <div id="latency-graph" class="latency-graph"></div>
@@ -611,38 +610,35 @@ function addLatencySample(sample: LatencySample) {
   latencySamples.push(sample);
   if (latencySamples.length > 60) latencySamples.shift(); // keep the graph bounded
   renderLatencyGraph();
-  updateLatencyHeadline();
 }
 
 function clearLatency() {
   latencySamples.length = 0;
   renderLatencyGraph();
-  const msg = document.getElementById("latency-msg");
-  if (msg) msg.textContent = "Waiting for a turn…";
-}
-
-function updateLatencyHeadline() {
-  const el = document.getElementById("latency-msg");
-  if (!el) return;
-  const s = latencySamples[latencySamples.length - 1];
-  if (!s) return;
-  el.textContent =
-    `speech → transcript ${s.speech_to_transcript_ms}ms · reply → audio ${s.tts_ms}ms · total ${s.total_ms}ms`;
 }
 
 function renderLatencyGraph() {
   const box = document.getElementById("latency-graph");
   if (!box) return;
 
-  // Keep the latest turns visible, oldest at the top like a scrollback log.
-  const rows = latencySamples.slice(-20);
-  if (!rows.length) {
-    box.innerHTML = `<div class="latency-empty">Latency will appear here after the first turn.</div>`;
+  // No turns yet: show a friendly placeholder in the graph area, away from the
+  // panel title so they don't run together.
+  if (!latencySamples.length) {
+    box.innerHTML = `<div class="latency-empty">Waiting for a turn…</div>`;
     return;
   }
 
-  box.innerHTML = rows
-    .map((s) => {
+  // Keep the latest turns visible, oldest at the top like a scrollback log.
+  const rows = latencySamples.slice(-20);
+  const last = latencySamples[latencySamples.length - 1];
+  const summary =
+    `latest · speech → transcript ${last.speech_to_transcript_ms}ms · ` +
+    `reply → audio ${last.tts_ms}ms · total ${last.total_ms}ms`;
+
+  box.innerHTML =
+    `<div class="latency-summary">${summary}</div>` +
+    rows
+      .map((s) => {
       const time = new Date(s.t * 1000).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
