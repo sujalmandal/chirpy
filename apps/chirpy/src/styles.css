@@ -271,6 +271,29 @@ button {
   min-height: 0;
 }
 
+.llm-warn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  background: rgba(245, 184, 76, 0.12);
+  border-bottom: 1px solid rgba(245, 184, 76, 0.3);
+  color: #f5b84c;
+  font-size: 13px;
+}
+
+.llm-warn[hidden] {
+  display: none;
+}
+
+.llm-warn svg {
+  flex-shrink: 0;
+}
+
+.llm-warn b {
+  color: #ffd28a;
+}
+
 .sys-strip {
   display: flex;
   align-items: center;

@@ -88,6 +88,17 @@ open "Chirpy.app"
 
 macOS requests microphone access on first launch. A changed bundle identifier or signing identity is treated as a new application by macOS and can require permission again.
 
+### First launch (onboarding)
+
+Chirpy works out of the box for STT/VAD/TTS — but it cannot answer until you point it at an LLM (no model is bundled). On first launch:
+
+1. The floating orb greets you; open **Debug Mode** via the `</>` button in the top-right of the orb.
+2. If no LLM is configured you'll see a **"LLM not configured yet"** banner across the top of the debug window, and the agent will say so if you speak to it.
+3. Click **Settings**, enter your OpenAI-compatible **endpoint**, **model**, and (if needed) **API key**, then **Save & Restart**. For LM Studio use `http://localhost:1234/v1`.
+4. **Reset to Default** restores the built-in system prompt and other defaults.
+
+The banner clears automatically once a model is configured.
+
 ## Configuration
 
 Right-click the floating orb and select **Open Debug Mode**. In the configuration panel, set:

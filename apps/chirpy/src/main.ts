@@ -387,6 +387,10 @@ function renderDebug() {
         <button id="models" title="Pick STT & TTS models">${ICONS.model} Models</button>
         <button id="restart" title="Restart the engine">${ICONS.restart} Restart</button>
       </header>
+      <div id="llm-warn" class="llm-warn" hidden>
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span>LLM not configured yet — open <b>Settings</b> to add an endpoint and model, then <b>Save &amp; Restart</b>.</span>
+      </div>
       <div class="sys-strip">
         <div class="stages">
           <div class="stage">VAD</div>
@@ -447,6 +451,7 @@ function renderDebug() {
   updateSystemModels();
   renderLatencyLegend();
   setupLogsSplitter();
+  updateLlmWarning();
 }
 
 // Make the bottom logs panel height adjustable with a drag handle, and keep the
@@ -481,6 +486,15 @@ function updateSystemModels() {
   if (stt) stt.textContent = settings.sttModel || "—";
   const tts = document.getElementById("sys-tts");
   if (tts) tts.textContent = settings.ttsVoice || "—";
+}
+
+// Show a first-run banner when the LLM isn't configured so a fresh user knows
+// to set an endpoint + model before chatting.
+function updateLlmWarning() {
+  const el = document.getElementById("llm-warn");
+  if (!el) return;
+  const needsConfig = !settings.llmModel.trim() || !settings.llmURL.trim();
+  el.hidden = !needsConfig;
 }
 
 function appendMessage(m: ChatMessage) {
@@ -685,6 +699,7 @@ function openSettings() {
       <label>Model <input id="s-model" placeholder="e.g. your-model-id" /></label>
       <label>API key <input id="s-key" type="password" placeholder="optional for local endpoints" /></label>
       <div class="modal-actions">
+        <button id="s-reset" title="Restore built-in defaults">Reset to Default</button>
         <button id="s-cancel">Cancel</button>
         <button id="s-save">Save &amp; Restart</button>
       </div>
@@ -696,6 +711,18 @@ function openSettings() {
   (modal.querySelector("#s-model") as HTMLInputElement).value = settings.llmModel;
   (modal.querySelector("#s-key") as HTMLInputElement).value = settings.llmAPIKey;
   (modal.querySelector("#s-cancel") as HTMLButtonElement).onclick = () => modal.remove();
+  (modal.querySelector("#s-reset") as HTMLButtonElement).onclick = () => {
+    settings.agentName = defaultSettings.agentName;
+    settings.systemPrompt = defaultSettings.systemPrompt;
+    settings.llmURL = defaultSettings.llmURL;
+    settings.llmModel = defaultSettings.llmModel;
+    settings.llmAPIKey = defaultSettings.llmAPIKey;
+    (modal.querySelector("#s-name") as HTMLInputElement).value = settings.agentName;
+    (modal.querySelector("#s-prompt") as HTMLTextAreaElement).value = settings.systemPrompt;
+    (modal.querySelector("#s-url") as HTMLInputElement).value = settings.llmURL;
+    (modal.querySelector("#s-model") as HTMLInputElement).value = settings.llmModel;
+    (modal.querySelector("#s-key") as HTMLInputElement).value = settings.llmAPIKey;
+  };
   (modal.querySelector("#s-save") as HTMLButtonElement).onclick = async () => {
     settings.agentName = (modal.querySelector("#s-name") as HTMLInputElement).value;
     settings.systemPrompt = (modal.querySelector("#s-prompt") as HTMLTextAreaElement).value;
@@ -703,6 +730,7 @@ function openSettings() {
     settings.llmModel = (modal.querySelector("#s-model") as HTMLInputElement).value;
     settings.llmAPIKey = (modal.querySelector("#s-key") as HTMLInputElement).value;
     await saveSettings();
+    updateLlmWarning();
     await invoke("restart_backend", { config: engineEnvironment() });
     modal.remove();
   };

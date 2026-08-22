@@ -8,10 +8,23 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
 engine_dir="$project_dir/engine/chirpy"
+
+# Locate a Python 3.12 interpreter (Homebrew's is the documented path, but accept
+# one already on PATH so the script "just works" on a fresh machine).
+PYTHON=""
+for cand in python3.12 /opt/homebrew/bin/python3.12; do
+    if command -v "$cand" >/dev/null 2>&1; then PYTHON="$cand"; break; fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: Python 3.12 not found." >&2
+    echo "  Install it with:  brew install python@3.12" >&2
+    echo "  (or ensure 'python3.12' is on your PATH) and re-run scripts/setup.sh." >&2
+    exit 1
+fi
 venv_python="$engine_dir/.venv/bin/python"
 
 echo "==> Creating Python 3.12 virtual environment"
-[ -d "$engine_dir/.venv" ] || /opt/homebrew/bin/python3.12 -m venv "$engine_dir/.venv"
+[ -d "$engine_dir/.venv" ] || "$PYTHON" -m venv "$engine_dir/.venv"
 
 echo "==> Installing dependencies"
 "$venv_python" -m pip install --upgrade pip
@@ -38,4 +51,8 @@ echo "==> Running smoke test (proves STT + TTS work on this Mac)"
 echo ""
 echo "Setup complete. Build the app with scripts/build-chirpy-app.sh,"
 echo "then open 'Chirpy.app'."
+echo ""
+echo "Next: the app needs an LLM to answer. Open the debug window"
+echo "(orb -> </> icon), click Settings, and set your endpoint + model,"
+echo "then Save & Restart. For LM Studio use http://localhost:1234/v1."
 
