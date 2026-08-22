@@ -2,6 +2,7 @@ faster-whisper
 kokoro
 numpy
 onnxruntime==1.29.0
+sherpa-onnx
 livekit-agents
 livekit-plugins-silero
 livekit-plugins-openai
