@@ -35,6 +35,7 @@ from bargein import (
     load_barge_in_policy,
 )
 from echoguard import EchoGuard
+from latency import LatencyTracker
 from plugins import KokoroTTS, WhisperSTT
 from vad import build_vad
 
@@ -127,7 +128,9 @@ async def _publish(ctx: JobContext, payload: dict) -> None:
         )
 
 
-def _setup_transcript_bridge(ctx: JobContext, session: AgentSession, guard: EchoGuard) -> None:
+def _setup_transcript_bridge(
+    ctx: JobContext, session: AgentSession, guard: EchoGuard, tracker: LatencyTracker | None = None
+) -> None:
     """Forward the voice session's transcript to the client as data events.
 
     The client renders a full user/assistant conversation from these events:
@@ -169,6 +172,8 @@ def _setup_transcript_bridge(ctx: JobContext, session: AgentSession, guard: Echo
             text = getattr(item, "text_content", None)
             if text:
                 guard.note_assistant_text(text)
+                if tracker is not None:
+                    tracker.handle("llm", "text", text)
                 logger.info(
                     "bridge assistant item role=%s text=%r",
                     getattr(item, "role", None),
@@ -223,8 +228,31 @@ async def entrypoint(ctx: JobContext):
     session = build_session(config)
     guard = EchoGuard(policy)
 
+    # Per-turn latency tracker: the STT/TTS plugins stamp VAD/STT/TTS timing,
+    # the bridge stamps LLM timing, and when a turn completes the tracker
+    # publishes a `latency` event the debug UI renders as a waterfall graph.
+    def _publish_latency(payload: dict) -> None:
+        try:
+            asyncio.get_running_loop().create_task(_publish(ctx, payload))
+        except RuntimeError:
+            pass
+        logger.info(
+            "latency turn=%s vad=%sms stt=%sms llm=%sms tts=%sms total=%sms speech_to_transcript=%sms",
+            payload.get("id"),
+            payload.get("vad_ms"),
+            payload.get("stt_ms"),
+            payload.get("llm_ms"),
+            payload.get("tts_ms"),
+            payload.get("total_ms"),
+            payload.get("speech_to_transcript_ms"),
+        )
+
+    tracker = LatencyTracker(publish=_publish_latency)
+    session._stt.latency_cb = lambda stage, event, text="": tracker.handle(stage, event, text)
+    session._tts.latency_cb = lambda stage, event, text="": tracker.handle(stage, event, text)
+
     agent = Agent(instructions=system_prompt)
-    _setup_transcript_bridge(ctx, session, guard)
+    _setup_transcript_bridge(ctx, session, guard, tracker)
     await session.start(
         agent=agent,
         room=ctx.room,
