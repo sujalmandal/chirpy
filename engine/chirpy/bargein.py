@@ -143,9 +143,14 @@ def _resolve_false_timeout(value: str | None) -> float | None:
 # --------------------------------------------------------------------------- #
 @dataclass
 class BargeInPolicy:
-    """Validated, runtime-tunable barge-in policy. Defaults mirror LiveKit's."""
+    """Validated, runtime-tunable barge-in policy.
 
-    enabled: bool = True
+    Disabled by default: with the native (non-WebRTC) audio output the browser
+    can't echo-cancel the agent's own voice, so barge-in would make the agent
+    hear itself and reply to itself. Enable explicitly via ``BARGE_IN=true``.
+    """
+
+    enabled: bool = False
     mode: str = "vad"
     min_duration: float = LK_INTERRUPTION_DEFAULTS["min_duration"]
     min_words: int = LK_INTERRUPTION_DEFAULTS["min_words"]
@@ -188,7 +193,7 @@ class BargeInPolicy:
 def load_barge_in_policy(config: dict[str, str]) -> BargeInPolicy:
     """Build a validated BargeInPolicy from config/env values."""
     return BargeInPolicy(
-        enabled=_as_bool(config.get("BARGE_IN"), default=True),
+        enabled=_as_bool(config.get("BARGE_IN"), default=False),
         mode=_resolve_mode(config),
         min_duration=max(
             0.0, _as_float(config.get("BARGE_IN_MIN_DURATION"), LK_INTERRUPTION_DEFAULTS["min_duration"])
