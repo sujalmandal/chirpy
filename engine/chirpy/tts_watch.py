@@ -37,11 +37,10 @@ def apply_tts_live(tts_plugin, data: dict) -> bool:
         or lang != tts_plugin._lang_code
         or abs(speed - tts_plugin._speed) > 1e-6
     )
-    tts_plugin._voice = voice
-    tts_plugin._lang_code = lang
-    tts_plugin._speed = speed
-
     if changed:
+        # reload() applies voice/speed immediately and recreates the pipeline on
+        # a language change so the new language actually takes effect.
+        tts_plugin.reload(lang_code=lang, voice=voice, speed=speed)
         logger.info("TTS voice hot-reloaded -> %s (lang=%s speed=%.1f)", voice, lang, speed)
         threading.Thread(target=_prefetch_voice, args=(voice,), daemon=True).start()
     return changed

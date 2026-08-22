@@ -16,6 +16,16 @@ class _FakeTTS:
         self._voice = "af_heart"
         self._lang_code = "a"
         self._speed = 1.0
+        self.reload_calls: list[dict] = []
+
+    def reload(self, **kwargs):
+        self.reload_calls.append(kwargs)
+        if "voice" in kwargs:
+            self._voice = kwargs["voice"]
+        if "lang_code" in kwargs:
+            self._lang_code = kwargs["lang_code"]
+        if "speed" in kwargs:
+            self._speed = kwargs["speed"]
 
 
 class _FakeSTT:
@@ -40,6 +50,34 @@ class ApplyTtsLiveTest(unittest.TestCase):
         tts = _FakeTTS()
         changed = apply_tts_live(tts, {"voice": "af_heart", "lang": "a", "speed": 1.0})
         self.assertFalse(changed)
+
+    def test_lang_change_calls_reload_with_lang_code(self):
+        tts = _FakeTTS()
+        apply_tts_live(tts, {"voice": "hf_alpha", "lang": "h", "speed": 1.0})
+        self.assertEqual(
+            tts.reload_calls,
+            [{"lang_code": "h", "voice": "hf_alpha", "speed": 1.0}],
+        )
+
+    def test_kokoro_reload_recreates_pipeline_on_lang_change(self):
+        from plugins.kokoro_tts import KokoroTTS
+
+        tts = KokoroTTS(lang_code="a", voice="af_heart")
+        tts._pipeline = object()  # simulate a loaded pipeline
+        tts.reload(lang_code="h", voice="hf_alpha")
+        self.assertEqual(tts._lang_code, "h")
+        self.assertEqual(tts._voice, "hf_alpha")
+        self.assertIsNone(tts._pipeline)  # recreated on next synthesis
+
+    def test_kokoro_reload_keeps_pipeline_on_voice_only_change(self):
+        from plugins.kokoro_tts import KokoroTTS
+
+        tts = KokoroTTS(lang_code="a", voice="af_heart")
+        pipeline = object()
+        tts._pipeline = pipeline
+        tts.reload(voice="am_michael")
+        self.assertIs(tts._pipeline, pipeline)  # language unchanged, keep pipeline
+        self.assertEqual(tts._voice, "am_michael")
 
     def test_prefetch_backgrounded_no_network_in_test(self):
         calls = []

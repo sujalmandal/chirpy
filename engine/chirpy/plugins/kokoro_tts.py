@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 
 import numpy as np
 import torch
@@ -27,6 +28,7 @@ class KokoroTTS(tts.TTS):
         voice: str = "af_heart",
         device: str = "cpu",
         speed: float = 1.0,
+        latency_cb=None,
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
@@ -38,19 +40,47 @@ class KokoroTTS(tts.TTS):
         self._device = device
         self._speed = speed
         self._pipeline: KPipeline | None = None
+        self._lock = threading.Lock()
+        # Optional callback(stage, event, text="") wired to the latency tracker.
+        self.latency_cb = latency_cb or (lambda stage, event, text="": None)
 
     def prewarm(self):
-        self._pipeline = KPipeline(
-            lang_code=self._lang_code,
-            device=self._device,
-        )
-
-    def _ensure_pipeline(self) -> KPipeline:
-        if self._pipeline is None:
+        with self._lock:
             self._pipeline = KPipeline(
                 lang_code=self._lang_code,
                 device=self._device,
             )
+
+    def reload(
+        self,
+        lang_code: str | None = None,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> None:
+        """Hot-reload voice/speed/language in place, without replacing the plugin.
+
+        The language is baked into the Kokoro pipeline at construction, so a
+        language change recreates the pipeline (on the next synthesis) with the
+        new ``lang_code``. Voice and speed apply immediately.
+        """
+        with self._lock:
+            if voice is not None:
+                self._voice = voice
+            if speed is not None:
+                self._speed = speed
+            if lang_code is not None and lang_code != self._lang_code:
+                self._lang_code = lang_code
+                # Recreate on next synthesize so the new language takes effect.
+                self._pipeline = None
+
+    def _ensure_pipeline(self) -> KPipeline:
+        if self._pipeline is None:
+            with self._lock:
+                if self._pipeline is None:
+                    self._pipeline = KPipeline(
+                        lang_code=self._lang_code,
+                        device=self._device,
+                    )
         return self._pipeline
 
     def synthesize(self, text: str, *, conn_options: APIConnectOptions = None):
@@ -73,14 +103,16 @@ class KokoroChunkedStream(tts.ChunkedStream):
             mime_type="audio/pcm",
         )
         loop = asyncio.get_running_loop()
+        tts_obj = self._tts
+        tts_obj.latency_cb("tts", "start")
 
         def synthesize_blocking() -> list[bytes]:
-            pipeline = self._tts._ensure_pipeline()
+            pipeline = tts_obj._ensure_pipeline()
             chunks: list[bytes] = []
             for result in pipeline(
                 self._input_text,
-                voice=self._tts._voice,
-                speed=self._tts._speed,
+                voice=tts_obj._voice,
+                speed=tts_obj._speed,
             ):
                 if result.audio is None:
                     continue
@@ -90,6 +122,7 @@ class KokoroChunkedStream(tts.ChunkedStream):
             return chunks
 
         chunks = await loop.run_in_executor(None, synthesize_blocking)
+        tts_obj.latency_cb("tts", "done")
         for chunk in chunks:
             output_emitter.push(chunk)
         output_emitter.flush()
