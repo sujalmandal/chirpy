@@ -177,7 +177,7 @@ class VoiceSession {
 
       await room.connect(LIVEKIT_URL, token);
       await room.localParticipant.setMicrophoneEnabled(true);
-      this.audioCtx = new AudioContext({ latencyHint: "playback" });
+      this.audioCtx = new AudioContext({ latencyHint: "interactive" });
       await this.audioCtx.resume();
       // Ensure the agent worker is dispatched into this room. The worker may
       // still be starting up, so retry until the agent actually joins the room

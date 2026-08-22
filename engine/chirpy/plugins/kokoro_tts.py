@@ -155,7 +155,7 @@ class KokoroChunkedStream(tts.ChunkedStream):
             if not parts:
                 return b""
             full = np.concatenate(parts)
-            trimmed = _trim_and_cap_silence(full, SAMPLE_RATE)
+            trimmed = _trim_edges(full, SAMPLE_RATE)
             return trimmed.tobytes()
 
         # Synthesize the whole reply, trim dead air, then stream it to the
@@ -165,35 +165,28 @@ class KokoroChunkedStream(tts.ChunkedStream):
         data = await loop.run_in_executor(None, synthesize_blocking)
         tts_obj.latency_cb("tts", "done")
         if data:
-            chunk_bytes = SAMPLE_RATE * 2 * 50 // 1000  # 50 ms of int16 mono
-            # Deliver slightly faster than real-time so the client builds a small
-            # jitter buffer instead of underrunning at every packet boundary.
-            interval = 50 / 1000 * 0.8
-            for i in range(0, len(data), chunk_bytes):
-                chunk = data[i : i + chunk_bytes]
-                # Feed this audio to the AEC as the reference (reverse stream) so
-                # the server can cancel the agent's own voice from the mic.
-                if tts_obj.apm is not None:
-                    chunk_pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                    _feed_reference(tts_obj.apm, chunk_pcm, SAMPLE_RATE)
-                output_emitter.push(chunk)
-                await asyncio.sleep(interval)
+            # Feed the audio to the AEC as the echo-cancellation reference.
+            if tts_obj.apm is not None:
+                pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                _feed_reference(tts_obj.apm, pcm, SAMPLE_RATE)
+            # Deliver as one continuous buffer (LiveKit's room output paces the
+            # RTP in real-time); per-chunk pacing caused client stutter.
+            output_emitter.push(data)
         output_emitter.flush()
 
 
-def _trim_and_cap_silence(
+def _trim_edges(
     pcm: np.ndarray,
     sample_rate: int,
     frame_ms: int = 10,
     threshold: float = 150.0,
-    max_silence_ms: int = 120,
 ) -> np.ndarray:
-    """Trim leading/trailing near-silence and cap internal silence runs.
+    """Trim only the leading/trailing near-silence from int16 PCM.
 
-    Kokoro adds ~800ms of padding on each end and ~200ms+ between sentences,
-    which plays back as an audible stop/start. This removes the dead air at the
-    start/end and trims internal silent runs down to ``max_silence_ms`` so the
-    reply flows continuously.
+    Kokoro pads ~800ms of dead air on each end. We cut it from the edges only —
+    never from the middle — because removing interior samples creates abrupt
+    waveform discontinuities (clicks) that play back as stutter/chopping. Natural
+    inter-sentence pauses are kept intact.
     """
     if pcm.size == 0:
         return pcm
@@ -207,29 +200,6 @@ def _trim_and_cap_silence(
     active = rms >= threshold
     if not active.any():
         return pcm
-
-    start_frame = int(np.argmax(active))
-    end_frame = int(nframes - np.argmax(active[::-1]))
-    max_frames = max(1, int(max_silence_ms / frame_ms))
-
-    # Mark frames to keep: everything in [start,end) except the excess of any
-    # internal silence run longer than max_frames.
-    keep = np.ones(end_frame, dtype=bool)
-    i = start_frame
-    while i < end_frame:
-        if not active[i]:
-            j = i
-            while j < end_frame and not active[j]:
-                j += 1
-            if j - i > max_frames:
-                keep[i + max_frames : j] = False
-            i = j
-        else:
-            i += 1
-
-    kept = [padded[f * frame_len : (f + 1) * frame_len] for f in range(start_frame, end_frame) if keep[f]]
-    if not kept:
-        return pcm
-    out = np.concatenate(kept)
-    # Drop any trailing padding zeros we introduced by frame-alignment.
-    return out.astype(pcm.dtype)
+    start = int(np.argmax(active)) * frame_len
+    end = min(int(nframes - np.argmax(active[::-1])) * frame_len, n)
+    return pcm[start:end]
