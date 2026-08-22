@@ -58,6 +58,30 @@ class ResolveTtsTest(unittest.TestCase):
         self.assertEqual(calls[2][0], "Systran/faster-whisper-base")
 
 
+class VoicesListTest(unittest.TestCase):
+    def test_voice_list_is_complete_and_language_prefixed(self):
+        from download import _KOKORO_VOICES, _KOKORO_LANGUAGES
+
+        self.assertGreaterEqual(len(_KOKORO_VOICES), 50)
+        for voice in _KOKORO_VOICES:
+            self.assertIn(voice[0], _KOKORO_LANGUAGES, voice)
+
+    def test_download_all_voices_prefetches_every_voice(self):
+        import download
+
+        fetched = []
+        orig = download.download_voice_only
+        download.download_voice_only = lambda voice, repo=None: fetched.append(voice)
+        orig_snap = download.snapshot_download
+        download.snapshot_download = lambda **kw: None
+        try:
+            download.download_all_tts_voices()
+        finally:
+            download.download_voice_only = orig
+            download.snapshot_download = orig_snap
+        self.assertEqual(len(fetched), len(download._KOKORO_VOICES))
+
+
 original_snapshot = __import__("download").snapshot_download
 original_hf = __import__("download").hf_hub_download
 

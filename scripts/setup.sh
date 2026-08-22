@@ -1,8 +1,9 @@
 #!/bin/zsh
 # One-time setup for the Chirpy voice engine: create the Python venv, install
-# dependencies, install the self-hosted LiveKit server, and run a smoke test
-# that downloads model weights (~225 MB: faster-whisper base + Kokoro) and
-# proves STT + TTS work on this Mac before you launch the app.
+# dependencies (including all Kokoro language tokenizers), install the
+# self-hosted LiveKit server, pre-download every speech model (faster-whisper,
+# all Kokoro voices, TEN-VAD), and run a smoke test so STT + TTS are proven to
+# work on this Mac before you launch the app.
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,9 +24,18 @@ else
     echo "livekit-server already installed"
 fi
 
-echo "==> Running smoke test (downloads model weights + synthesizes a phrase)"
+echo "==> Downloading Japanese tokenizer dictionary (for Kokoro 'ja')"
+"$venv_python" -m unidic download
+
+echo "==> Pre-downloading speech models (faster-whisper, all Kokoro voices, TEN-VAD)"
+"$venv_python" "$engine_dir/download.py" stt base
+"$venv_python" "$engine_dir/download.py" tts all
+"$venv_python" "$engine_dir/download.py" vad
+
+echo "==> Running smoke test (proves STT + TTS work on this Mac)"
 "$venv_python" "$engine_dir/validate.py"
 
 echo ""
 echo "Setup complete. Build the app with scripts/build-chirpy-app.sh,"
 echo "then open 'Chirpy.app'."
+
