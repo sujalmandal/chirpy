@@ -40,10 +40,13 @@ fi
 echo "==> Downloading Japanese tokenizer dictionary (for Kokoro 'ja')"
 "$venv_python" -m unidic download
 
-echo "==> Pre-downloading speech models (faster-whisper, all Kokoro voices, TEN-VAD)"
-"$venv_python" "$engine_dir/download.py" stt base
-"$venv_python" "$engine_dir/download.py" tts all
+echo "==> Pre-downloading lightest speech models (tiny STT, default TTS voice, TEN-VAD)"
+"$venv_python" "$engine_dir/download.py" stt tiny
+"$venv_python" "$engine_dir/download.py" tts af_heart
 "$venv_python" "$engine_dir/download.py" vad
+
+echo "==> Pre-downloading bundled local LLM (Qwen2.5-0.5B, ~1GB)"
+"$venv_python" -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-0.5B-Instruct')"
 
 echo "==> Running smoke test (proves STT + TTS work on this Mac)"
 "$venv_python" "$engine_dir/validate.py"
@@ -52,7 +55,8 @@ echo ""
 echo "Setup complete. Build the app with scripts/build-chirpy-app.sh,"
 echo "then open 'Chirpy.app'."
 echo ""
-echo "Next: the app needs an LLM to answer. Open the debug window"
-echo "(orb -> </> icon), click Settings, and set your endpoint + model,"
+echo "It works out of the box: a bundled local LLM, tiny STT, and Kokoro TTS"
+echo "are all pre-downloaded. To use a stronger LLM later, open the debug"
+echo "window (orb -> </> icon), click Settings, set your endpoint + model,"
 echo "then Save & Restart. For LM Studio use http://localhost:1234/v1."
 

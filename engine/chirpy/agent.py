@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 
 from livekit import rtc
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, room_io
+from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, llm, room_io
 from livekit.plugins import dtln, openai
 
 from bargein import (
@@ -37,6 +37,8 @@ from bargein import (
 from echoguard import EchoGuard
 from latency import LatencyTracker
 from llm_fallback import FallbackLLM
+from local_llm import DEFAULT_REPO as LOCAL_LLM_DEFAULT_REPO
+from local_llm import LocalQwenLLM
 from plugins import KokoroTTS, WhisperSTT
 from vad import build_vad
 
@@ -117,13 +119,21 @@ def build_session(config: dict[str, str]) -> AgentSession:
     )
 
 
-def _build_llm(config: dict[str, str]) -> FallbackLLM:
-    """Build the LLM wrapped in a config-guidance fallback.
+def _build_llm(config: dict[str, str]) -> llm.LLM:
+    """Build the session's LLM.
 
-    If the endpoint or model is missing, or the endpoint can't be reached, the
-    agent replies asking the user to configure their LLM rather than staying
-    silent (see :mod:`llm_fallback`).
+    Defaults to the bundled in-process Qwen model so Chirpy answers out of the
+    box with no external endpoint. Setting ``LLM_BACKEND=remote`` (e.g. by
+    configuring a model in the debug UI) uses the OpenAI-compatible endpoint
+    instead, wrapped in a config-guidance fallback so a missing/bad endpoint
+    produces a helpful spoken reply rather than silence.
     """
+    backend = (config.get("LLM_BACKEND") or "local").strip().lower()
+    if backend != "remote":
+        repo = config.get("LOCAL_LLM_MODEL") or LOCAL_LLM_DEFAULT_REPO
+        logger.info("LLM backend: bundled local model (%s)", repo)
+        return LocalQwenLLM(repo_id=repo)
+
     base_url = (config.get("LLM_BASE_URL") or "").strip()
     model = (config.get("LLM_MODEL_NAME") or "").strip()
     api_key = config.get("LLM_API_KEY") or "local"

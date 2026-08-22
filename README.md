@@ -66,14 +66,16 @@ flowchart LR
 - macOS 14 or later
 - Homebrew Python 3.12 at `/opt/homebrew/bin/python3.12`
 - Homebrew (for `livekit-server`)
-- An OpenAI-compatible chat-completions endpoint, such as LM Studio or a hosted provider
-- Internet access for the initial speech-model download
+- Internet access for the initial one-time model download
 
-The initial setup downloads the small local speech models (faster-whisper `base` ~145 MB and Kokoro ~80 MB). They are subsequently loaded from the local Hugging Face cache.
+The initial setup downloads the lightest on-device models: a bundled local LLM
+(Qwen2.5-0.5B ~1 GB), faster-whisper `tiny` STT (~39 MB), and Kokoro TTS
+(~80 MB). They are subsequently loaded from the local Hugging Face cache.
 
 ## Quick start
 
-Install the local engine, its dependencies, the LiveKit server, and validate the speech stack:
+Chirpy is install-and-run — no configuration needed. Install the local engine,
+its dependencies, the LiveKit server, and validate the speech stack:
 
 ```bash
 scripts/setup.sh
@@ -90,14 +92,16 @@ macOS requests microphone access on first launch. A changed bundle identifier or
 
 ### First launch (onboarding)
 
-Chirpy works out of the box for STT/VAD/TTS — but it cannot answer until you point it at an LLM (no model is bundled). On first launch:
+Chirpy answers **out of the box**: it bundles a small local LLM, tiny STT, and
+Kokoro TTS, so you can start talking immediately after setup. Open **Debug Mode**
+via the `</>` button in the top-right of the orb to see the transcript, latency
+graph, and logs.
 
-1. The floating orb greets you; open **Debug Mode** via the `</>` button in the top-right of the orb.
-2. If no LLM is configured you'll see a **"LLM not configured yet"** banner across the top of the debug window, and the agent will say so if you speak to it.
-3. Click **Settings**, enter your OpenAI-compatible **endpoint**, **model**, and (if needed) **API key**, then **Save & Restart**. For LM Studio use `http://localhost:1234/v1`.
-4. **Reset to Default** restores the built-in system prompt and other defaults.
-
-The banner clears automatically once a model is configured.
+To upgrade later — e.g. use a stronger model or a hosted endpoint — click
+**Settings** in the debug window, enter your OpenAI-compatible **endpoint**,
+**model**, and (if needed) **API key**, then **Save & Restart**. For LM Studio
+use `http://localhost:1234/v1`. **Reset to Default** restores the built-in
+system prompt and other defaults.
 
 ## Configuration
 

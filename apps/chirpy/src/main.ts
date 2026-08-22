@@ -60,7 +60,7 @@ Accuracy and behavior:
   llmURL: "http://localhost:1234/v1",
   llmModel: "",
   llmAPIKey: "",
-  sttModel: "base",
+  sttModel: "tiny",
   sttLanguage: "en",
   ttsVoice: "af_heart",
   ttsLang: "a",
@@ -95,9 +95,13 @@ async function saveSettings() {
 function engineEnvironment(): Record<string, string> {
   const name = settings.agentName.trim();
   const resolved = settings.systemPrompt.replaceAll("{{agent_name}}", name);
+  const useRemote = settings.llmModel.trim() !== "" && settings.llmURL.trim() !== "";
   return {
     AGENT_NAME: name,
     ASSISTANT_SYSTEM: resolved,
+    // A blank model uses the bundled in-process Qwen; setting an endpoint +
+    // model switches the engine to that OpenAI-compatible LLM.
+    LLM_BACKEND: useRemote ? "remote" : "local",
     LLM_BASE_URL: settings.llmURL.trim(),
     LLM_MODEL_NAME: settings.llmModel.trim(),
     LLM_API_KEY: settings.llmAPIKey,
@@ -488,13 +492,16 @@ function updateSystemModels() {
   if (tts) tts.textContent = settings.ttsVoice || "—";
 }
 
-// Show a first-run banner when the LLM isn't configured so a fresh user knows
-// to set an endpoint + model before chatting.
+// The bundled local LLM works out of the box, so there's nothing to configure.
+// Only flag a half-entered remote setup (endpoint without a model, or vice
+// versa) so a user who's trying to switch backends isn't left confused.
 function updateLlmWarning() {
   const el = document.getElementById("llm-warn");
   if (!el) return;
-  const needsConfig = !settings.llmModel.trim() || !settings.llmURL.trim();
-  el.hidden = !needsConfig;
+  const model = settings.llmModel.trim();
+  const url = settings.llmURL.trim();
+  const incompleteRemote = (model && !url) || (url && !model);
+  el.hidden = !incompleteRemote;
 }
 
 function appendMessage(m: ChatMessage) {
@@ -1050,9 +1057,9 @@ async function init() {
       if (el) el.textContent = s;
     };
     const model = document.getElementById("llm-model");
-    if (model) model.textContent = settings.llmModel || "—";
+    if (model) model.textContent = settings.llmModel.trim() || "local · qwen2.5-0.5b";
     const url = document.getElementById("llm-url");
-    if (url) url.textContent = settings.llmURL || "—";
+    if (url) url.textContent = settings.llmModel.trim() ? settings.llmURL : "in-process";
   } else {
     renderOrb();
     session.onStatus = (s) => {
