@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
 import threading
 import time
 
@@ -18,6 +20,18 @@ from kokoro import KPipeline
 logger = logging.getLogger("chirpy.kokoro_tts")
 
 SAMPLE_RATE = 24_000
+
+
+def _send_native(data: bytes) -> None:
+    """Stream TTS PCM to the app's native (non-WebRTC) audio output."""
+    port = os.environ.get("CHIRPY_NATIVE_AUDIO_PORT")
+    if not port:
+        return
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=1.0) as s:
+            s.sendall(data)
+    except Exception:  # native audio unavailable; fall back to silence/room
+        pass
 
 
 def _feed_reference(apm, pcm: np.ndarray, sample_rate: int) -> None:
@@ -169,8 +183,10 @@ class KokoroChunkedStream(tts.ChunkedStream):
             if tts_obj.apm is not None:
                 pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                 _feed_reference(tts_obj.apm, pcm, SAMPLE_RATE)
-            # Deliver as one continuous buffer (LiveKit's room output paces the
-            # RTP in real-time); per-chunk pacing caused client stutter.
+            # Play natively (bypassing the stutter-prone webview WebRTC path).
+            _send_native(data)
+            # Also publish to the room so the session's turn handling stays in
+            # sync (the webview no longer plays this track).
             output_emitter.push(data)
         output_emitter.flush()
 

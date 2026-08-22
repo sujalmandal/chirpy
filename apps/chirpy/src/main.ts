@@ -238,19 +238,11 @@ class VoiceSession {
   }
 
   private attachPlayback(track: Track) {
-    // Play the agent's audio through the Web Audio graph, which buffers
-    // smoothly on live streams (a bare <audio> element underruns/stutters).
-    // Echo cancellation of the agent's own voice is handled server-side by the
-    // engine (AudioProcessingModule AEC), so it still won't hear itself here.
-    const ctx = this.audioCtx;
-    if (!ctx) return;
-    const source = ctx.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
-    const gain = ctx.createGain();
-    gain.gain.value = this.outputMuted ? 0 : 1;
-    source.connect(gain);
-    gain.connect(ctx.destination);
-    this.playbackSources.push(source);
-    this.playbackGains.push(gain);
+    // Agent audio is played natively by the Rust backend (CoreAudio) instead of
+    // through the webview's WebKit WebRTC path, which stutters. We still
+    // subscribe to the track so LiveKit keeps the agent's speech in sync, but we
+    // do NOT render it to the webview (avoiding double audio).
+    void track;
   }
 
   private handleData(payload: Uint8Array) {

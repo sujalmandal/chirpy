@@ -10,6 +10,8 @@ use livekit_protocol as proto;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 
+mod native_audio;
+
 const LIVEKIT_URL: &str = "ws://127.0.0.1:7880";
 const LIVEKIT_API_KEY: &str = "devkey";
 const LIVEKIT_API_SECRET: &str = "secret";
@@ -122,7 +124,8 @@ fn start_backend(state: tauri::State<Mutex<BackendState>>, config: serde_json::V
             .stderr(Stdio::from(file))
             .env("LIVEKIT_URL", LIVEKIT_URL)
             .env("LIVEKIT_API_KEY", LIVEKIT_API_KEY)
-            .env("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET);
+            .env("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET)
+            .env("CHIRPY_NATIVE_AUDIO_PORT", native_audio::DEFAULT_PORT.to_string());
         if let Some(obj) = config.as_object() {
             for (k, v) in obj {
                 if let Some(s) = v.as_str() {
@@ -455,6 +458,11 @@ pub fn run() {
             set_stt
         ])
         .setup(|app| {
+            // Start the native (non-WebRTC) audio output the agent's TTS plays
+            // through, so we don't depend on the webview's WebKit audio path.
+            if let Err(e) = native_audio::NativeAudioServer::start(native_audio::DEFAULT_PORT) {
+                eprintln!("could not start native audio server: {e}");
+            }
             let _ = app;
             Ok(())
         })
