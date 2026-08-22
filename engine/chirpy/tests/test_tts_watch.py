@@ -79,6 +79,20 @@ class ApplyTtsLiveTest(unittest.TestCase):
         self.assertIs(tts._pipeline, pipeline)  # language unchanged, keep pipeline
         self.assertEqual(tts._voice, "am_michael")
 
+    def test_kokoro_reload_reverts_on_pipeline_failure(self):
+        from unittest import mock
+
+        from plugins.kokoro_tts import KokoroTTS
+
+        tts = KokoroTTS(lang_code="a", voice="af_heart")
+        working = object()
+        tts._pipeline = working  # a working English pipeline
+        with mock.patch("plugins.kokoro_tts.KPipeline", side_effect=RuntimeError("boom")):
+            tts.reload(lang_code="j", voice="jf_alpha")
+            tts._ensure_pipeline()  # creation fails -> revert, don't crash
+        self.assertEqual(tts._lang_code, "a")  # reverted
+        self.assertIs(tts._pipeline, working)  # kept the working pipeline
+
     def test_prefetch_backgrounded_no_network_in_test(self):
         calls = []
 

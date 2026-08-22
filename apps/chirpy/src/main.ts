@@ -587,6 +587,12 @@ const TTS_LANG_NAMES: Record<string, string> = {
   a: "American English", b: "British English", e: "Spanish", f: "French",
   h: "Hindi", i: "Italian", j: "Japanese", p: "Portuguese", z: "Chinese (Mandarin)",
 };
+
+// Kokoro voices are prefixed with their language code, so the first letter of a
+// voice id identifies its language (af_*, am_* = English; hf_*, hm_* = Hindi; …).
+function voicesForLang(lang: string): string[] {
+  return TTS_VOICES.filter((v) => v.startsWith(lang));
+}
 const HF_STT_URL = "https://huggingface.co/models?search=faster-whisper";
 const HF_TTS_URL = "https://huggingface.co/models?search=kokoro";
 
@@ -665,24 +671,39 @@ function openModelPicker() {
   };
 
   // --- TTS ---
-  fillSelect(modal, "#mp-tts", TTS_VOICES, settings.ttsVoice);
-  fillSelect(modal, "#mp-tts-lang", TTS_LANGS, settings.ttsLang, TTS_LANG_NAMES);
+  const ttsLangSel = modal.querySelector("#mp-tts-lang") as HTMLSelectElement;
+  const ttsVoiceSel = modal.querySelector("#mp-tts") as HTMLSelectElement;
   const ttsCustom = modal.querySelector("#mp-tts-custom") as HTMLInputElement;
-  ttsCustom.value = TTS_VOICES.includes(settings.ttsVoice) ? "" : settings.ttsVoice;
+
+  // Kokoro voices are prefixed with their language code, so the voice list
+  // follows the selected language to avoid voice/language mismatches.
+  function refreshTTSVoices() {
+    const lang = ttsLangSel.value;
+    const voices = voicesForLang(lang);
+    const current = settings.ttsVoice;
+    const pick = voices.includes(current) ? current : (voices[0] || "");
+    ttsVoiceSel.innerHTML = voices.map((v) =>
+      `<option value="${v}" ${v === pick ? "selected" : ""}>${v}</option>`).join("");
+  }
+
+  fillSelect(modal, "#mp-tts-lang", TTS_LANGS, settings.ttsLang, TTS_LANG_NAMES);
+  refreshTTSVoices();
+  ttsLangSel.onchange = refreshTTSVoices;
+
   (modal.querySelector("#mp-tts-browse") as HTMLButtonElement).onclick = () =>
     invoke("open_url", { url: HF_TTS_URL }).catch(console.error);
   (modal.querySelector("#mp-tts-download") as HTMLButtonElement).onclick = () =>
-    runDownload(modal, "tts", () => ttsCustom.value.trim() || sttSelectValue(modal, "#mp-tts"));
+    runDownload(modal, "tts", () => ttsCustom.value.trim() || ttsVoiceSel.value);
   (modal.querySelector("#mp-tts-apply") as HTMLButtonElement).onclick = async () => {
-    settings.ttsVoice = ttsCustom.value.trim() || sttSelectValue(modal, "#mp-tts");
-    settings.ttsLang = sttSelectValue(modal, "#mp-tts-lang");
+    settings.ttsVoice = ttsCustom.value.trim() || ttsVoiceSel.value;
+    settings.ttsLang = ttsLangSel.value;
     await saveSettings();
     updateSystemModels();
     const status = modal.querySelector("#mp-tts-status") as HTMLElement;
     status.textContent = "Applying…";
     try {
       await invoke("set_tts", { voice: settings.ttsVoice, lang: settings.ttsLang });
-      status.textContent = `Voice switched to ${settings.ttsVoice} — applied live, no restart.`;
+      status.textContent = `Voice switched to ${settings.ttsVoice} (${TTS_LANG_NAMES[settings.ttsLang] || settings.ttsLang}) — applied live, no restart.`;
     } catch (e) {
       status.textContent = `Apply failed: ${e}`;
     }

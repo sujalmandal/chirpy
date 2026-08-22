@@ -1,5 +1,6 @@
 faster-whisper
 kokoro
+misaki[ja,zh]
 numpy
 onnxruntime==1.29.0
 sherpa-onnx

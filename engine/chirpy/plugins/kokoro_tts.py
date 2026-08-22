@@ -28,7 +28,6 @@ class KokoroTTS(tts.TTS):
         voice: str = "af_heart",
         device: str = "cpu",
         speed: float = 1.0,
-        latency_cb=None,
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
@@ -40,16 +39,12 @@ class KokoroTTS(tts.TTS):
         self._device = device
         self._speed = speed
         self._pipeline: KPipeline | None = None
+        self._prev_pipeline: KPipeline | None = None
+        self._prev_lang: str | None = None
         self._lock = threading.Lock()
-        # Optional callback(stage, event, text="") wired to the latency tracker.
-        self.latency_cb = latency_cb or (lambda stage, event, text="": None)
 
     def prewarm(self):
-        with self._lock:
-            self._pipeline = KPipeline(
-                lang_code=self._lang_code,
-                device=self._device,
-            )
+        self._ensure_pipeline()
 
     def reload(
         self,
@@ -61,7 +56,9 @@ class KokoroTTS(tts.TTS):
 
         The language is baked into the Kokoro pipeline at construction, so a
         language change recreates the pipeline (on the next synthesis) with the
-        new ``lang_code``. Voice and speed apply immediately.
+        new ``lang_code``. Voice and speed apply immediately. If the new language
+        can't be loaded (e.g. a missing tokenizer dependency), the previous
+        pipeline/language is kept and the failure is logged rather than crashing.
         """
         with self._lock:
             if voice is not None:
@@ -69,6 +66,8 @@ class KokoroTTS(tts.TTS):
             if speed is not None:
                 self._speed = speed
             if lang_code is not None and lang_code != self._lang_code:
+                self._prev_pipeline = self._pipeline
+                self._prev_lang = self._lang_code
                 self._lang_code = lang_code
                 # Recreate on next synthesize so the new language takes effect.
                 self._pipeline = None
@@ -77,10 +76,23 @@ class KokoroTTS(tts.TTS):
         if self._pipeline is None:
             with self._lock:
                 if self._pipeline is None:
-                    self._pipeline = KPipeline(
-                        lang_code=self._lang_code,
-                        device=self._device,
-                    )
+                    try:
+                        self._pipeline = KPipeline(
+                            lang_code=self._lang_code,
+                            device=self._device,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "failed to load Kokoro pipeline for lang %r: %s",
+                            self._lang_code, exc,
+                        )
+                        if self._prev_pipeline is not None:
+                            # Revert to the last working language so we don't crash.
+                            self._pipeline = self._prev_pipeline
+                            self._lang_code = self._prev_lang or self._lang_code
+                            logger.warning("reverted TTS language to %r", self._lang_code)
+                    self._prev_pipeline = None
+                    self._prev_lang = None
         return self._pipeline
 
     def synthesize(self, text: str, *, conn_options: APIConnectOptions = None):
@@ -104,7 +116,6 @@ class KokoroChunkedStream(tts.ChunkedStream):
         )
         loop = asyncio.get_running_loop()
         tts_obj = self._tts
-        tts_obj.latency_cb("tts", "start")
 
         def synthesize_blocking() -> list[bytes]:
             pipeline = tts_obj._ensure_pipeline()
@@ -122,7 +133,6 @@ class KokoroChunkedStream(tts.ChunkedStream):
             return chunks
 
         chunks = await loop.run_in_executor(None, synthesize_blocking)
-        tts_obj.latency_cb("tts", "done")
         for chunk in chunks:
             output_emitter.push(chunk)
         output_emitter.flush()
