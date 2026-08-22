@@ -433,6 +433,22 @@ async fn download_model(app: tauri::AppHandle, kind: String, id: String) -> Resu
     .map_err(|e| e.to_string())?
 }
 
+fn kill_stale_backend() {
+    // Kill any process listening on LiveKit's ports (a leftover livekit-server
+    // from a force-killed run that skipped the exit handler). Precise (by port)
+    // rather than `pkill -f`, which can match unrelated command lines.
+    for spec in ["TCP:7880", "UDP:7882"] {
+        let out = Command::new("lsof").args(["-ti", spec]).output();
+        if let Ok(out) = out {
+            for pid in String::from_utf8_lossy(&out.stdout).trim().split_whitespace() {
+                let _ = Command::new("kill").arg("-9").arg(pid).status();
+            }
+        }
+    }
+    // The orphaned agent exits once livekit goes away; give it a moment.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -458,6 +474,10 @@ pub fn run() {
             set_stt
         ])
         .setup(|app| {
+            // Clean up orphaned backend processes from a previous run that was
+            // force-killed (skipping the exit handler), so ports are free for a
+            // fresh spawn.
+            kill_stale_backend();
             // Start the native (non-WebRTC) audio output the agent's TTS plays
             // through, so we don't depend on the webview's WebKit audio path.
             if let Err(e) = native_audio::NativeAudioServer::start(native_audio::DEFAULT_PORT) {
