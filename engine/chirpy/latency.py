@@ -93,12 +93,13 @@ class LatencyTracker:
             turn = self._turn
             if turn["llm_first"] is None:
                 turn["llm_first"] = time.time()
-                turn["tts_start"] = turn["llm_first"]
             turn["assistant_text"] += text
 
     def on_tts_start(self):
+        # The real TTS synthesis start (LiveKit's conversation_item_added fires
+        # *after* synthesis, so it can't be used to bound the TTS stage).
         with self._lock:
-            if self._turn is not None and self._turn["tts_start"] is None:
+            if self._turn is not None:
                 self._turn["tts_start"] = time.time()
 
     def on_tts_done(self):
@@ -138,9 +139,11 @@ class LatencyTracker:
     def _finalize(self, t: dict) -> dict:
         vad_ms = _ms(t["vad_start"], t["vad_end"]) or 0
         stt_ms = _ms(t["vad_end"], t["stt_done"]) or 0
-        llm_ms = _ms(t["stt_done"], t["llm_first"]) or 0
-        tts_ms = _ms(t["llm_first"], t["tts_done"]) or 0
-        tts_gen_ms = _ms(t["tts_start"], t["tts_done"]) or 0
+        # LLM stage is bounded by the moment TTS begins synthesis (that's when
+        # the assistant text was available); conversation_item_added is too late.
+        llm_ms = _ms(t["stt_done"], t["tts_start"]) or 0
+        tts_ms = _ms(t["tts_start"], t["tts_done"]) or 0
+        tts_gen_ms = tts_ms
         total_ms = _ms(t["vad_start"], t["tts_done"]) or 0
 
         # Chrome-waterfall style segments laid out on the turn timeline. Each
