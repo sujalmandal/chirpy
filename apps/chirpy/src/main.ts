@@ -123,6 +123,8 @@ class VoiceSession {
   private speaking = false;
   private outputMuted = false;
   private playbackEls: HTMLAudioElement[] = [];
+  private playbackSources: MediaStreamAudioSourceNode[] = [];
+  private playbackGains: GainNode[] = [];
   private reply = "";
   private transcript = "";
 
@@ -212,6 +214,10 @@ class VoiceSession {
     this.room = null;
     this.playbackEls.forEach((el) => el.remove());
     this.playbackEls = [];
+    this.playbackSources.forEach((n) => n.disconnect());
+    this.playbackGains.forEach((n) => n.disconnect());
+    this.playbackSources = [];
+    this.playbackGains = [];
     this.audioCtx?.close();
     this.audioCtx = null;
     this.onStatus("Conversation stopped");
@@ -219,7 +225,7 @@ class VoiceSession {
 
   toggleOutputMuted() {
     this.outputMuted = !this.outputMuted;
-    this.playbackEls.forEach((el) => (el.muted = this.outputMuted));
+    this.playbackGains.forEach((g) => (g.gain.value = this.outputMuted ? 0 : 1));
     if (this.room) {
       this.room.remoteParticipants.forEach((p) => {
         p.audioTrackPublications.forEach((pub) => pub.setSubscribed(!this.outputMuted));
@@ -235,18 +241,28 @@ class VoiceSession {
   }
 
   private attachPlayback(track: Track) {
-    // Play the agent's audio through an <audio> element (not Web Audio). The
-    // browser's echo canceller needs this rendered audio as a reference to
-    // cancel it from the microphone; routing playback through the Web Audio
-    // graph (AudioContext.destination) made the agent hear its own voice and
-    // reply to itself.
-    const el = document.createElement("audio");
-    el.srcObject = new MediaStream([track.mediaStreamTrack]);
-    el.autoplay = true;
-    el.muted = this.outputMuted;
-    el.style.display = "none";
-    document.body.appendChild(el);
-    this.playbackEls.push(el);
+    const ctx = this.audioCtx;
+    if (!ctx) return;
+    // 1) Inaudible <audio> reference (volume 0 but still "playing") so the
+    //    browser's echo canceller sees the agent's output and cancels it from
+    //    the microphone. Without this the agent hears its own voice and replies
+    //    to itself.
+    const ref = document.createElement("audio");
+    ref.srcObject = new MediaStream([track.mediaStreamTrack]);
+    ref.autoplay = true;
+    ref.volume = 0;
+    ref.style.display = "none";
+    document.body.appendChild(ref);
+    this.playbackEls.push(ref);
+    // 2) Audible playback through the Web Audio graph for smooth (non-stuttering)
+    //    buffering of the live WebRTC stream.
+    const source = ctx.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+    const gain = ctx.createGain();
+    gain.gain.value = this.outputMuted ? 0 : 1;
+    source.connect(gain);
+    gain.connect(ctx.destination);
+    this.playbackSources.push(source);
+    this.playbackGains.push(gain);
   }
 
   private handleData(payload: Uint8Array) {
