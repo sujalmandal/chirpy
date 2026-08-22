@@ -127,8 +127,8 @@ class VoiceSession {
   private transcript = "";
 
   onStatus: (s: string) => void = () => {};
-  onTranscript: (t: string) => void = () => {};
-  onReply: (t: string) => void = () => {};
+  onTranscript: (t: string, final?: boolean) => void = () => {};
+  onReply: (t: string, final?: boolean) => void = () => {};
   onSpeaking: (b: boolean) => void = () => {};
   onListening: (b: boolean) => void = () => {};
   onUserMessage: (text: string) => void = () => {};
@@ -257,22 +257,24 @@ class VoiceSession {
     switch (event.type) {
       case "partial":
         this.transcript = (event.text as string) ?? "";
-        this.onTranscript(this.transcript);
+        this.onTranscript(this.transcript, false);
         this.onUserPartial(this.transcript);
         break;
       case "user":
         this.transcript = (event.text as string) ?? "";
         this.reply = "";
+        this.onTranscript(this.transcript, true);
         this.onUserMessage(this.transcript);
         break;
       case "assistant_delta":
         this.reply += (event.text as string) ?? "";
-        this.onReply(this.reply);
+        this.onReply(this.reply, false);
         this.onAssistantDelta((event.text as string) ?? "");
         break;
       case "assistant_end":
         this.speaking = false;
         this.onSpeaking(false);
+        this.onReply(this.reply, true);
         this.onAssistantEnd();
         break;
       case "latency":
@@ -286,6 +288,11 @@ class VoiceSession {
 }
 
 const session = new VoiceSession();
+
+// Whether the user explicitly muted the microphone. The session auto-starts
+// when the backend becomes ready, so without this the mute button would be
+// immediately overridden by pollStatus.
+let micMuted = false;
 
 // ---------------------------------------------------------------------------
 // UI helpers
@@ -336,7 +343,13 @@ function renderOrb() {
     </div>
   `;
   document.getElementById("mic")!.onclick = () => {
-    session.isListening ? session.stop() : session.start();
+    if (session.isListening) {
+      micMuted = true;
+      session.stop();
+    } else {
+      micMuted = false;
+      session.start();
+    }
     updateOrbControls();
   };
   document.getElementById("speaker")!.onclick = () => {
@@ -994,9 +1007,10 @@ async function pollStatus() {
     }
   }
   // Only the main window drives the voice session; the debug window just
-  // observes status and the conversation via events.
+  // observes status and the conversation via events. Don't auto-start if the
+  // user explicitly muted the mic.
   if (!isDebug) {
-    if (status.ready && !session.isListening) session.start();
+    if (status.ready && !session.isListening && !micMuted) session.start();
     if (!status.ready && session.isListening) session.stop();
   }
 }
@@ -1066,8 +1080,8 @@ async function init() {
       const el = document.getElementById("status");
       if (el) el.textContent = s;
     };
-    session.onTranscript = (t) => showCaption("transcript", t);
-    session.onReply = (t) => showCaption("reply", t);
+    session.onTranscript = (t, final) => showCaption("transcript", t, final);
+    session.onReply = (t, final) => showCaption("reply", t, final);
     session.onSpeaking = (b) => {
       const orb = document.getElementById("orb");
       if (orb) orb.classList.toggle("speaking", b);
@@ -1088,7 +1102,7 @@ async function init() {
 }
 
 let captionTimers: Record<string, number> = {};
-function showCaption(id: string, text: string) {
+function showCaption(id: string, text: string, persist = false) {
   const el = document.getElementById(id);
   if (!el) return;
   const trimmed = text.trim();
@@ -1096,6 +1110,12 @@ function showCaption(id: string, text: string) {
   el.textContent = trimmed;
   el.classList.add("visible");
   if (captionTimers[id]) window.clearTimeout(captionTimers[id]);
+  // Final transcripts/replies stay on the orb until the next turn replaces
+  // them; live partials still fade out after a moment so they don't linger.
+  if (persist) {
+    captionTimers[id] = 0;
+    return;
+  }
   captionTimers[id] = window.setTimeout(() => {
     el.classList.remove("visible");
   }, 6000);
