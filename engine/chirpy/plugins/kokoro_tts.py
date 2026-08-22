@@ -28,6 +28,7 @@ class KokoroTTS(tts.TTS):
         voice: str = "af_heart",
         device: str = "cpu",
         speed: float = 1.0,
+        latency_cb=None,
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
@@ -42,6 +43,9 @@ class KokoroTTS(tts.TTS):
         self._prev_pipeline: KPipeline | None = None
         self._prev_lang: str | None = None
         self._lock = threading.Lock()
+        # Optional callback(stage, event, text="") wired to the latency tracker
+        # by the agent so TTS timing reaches the debug UI.
+        self.latency_cb = latency_cb or (lambda stage, event, text="": None)
 
     def prewarm(self):
         self._ensure_pipeline()
@@ -140,7 +144,9 @@ class KokoroChunkedStream(tts.ChunkedStream):
         # continuous buffer. Pushing Kokoro's per-sentence chunks separately
         # left 200ms+ of silence between sentences and 800ms on each end, which
         # played back as "pausing and unpausing."
+        tts_obj.latency_cb("tts", "start")
         data = await loop.run_in_executor(None, synthesize_blocking)
+        tts_obj.latency_cb("tts", "done")
         if data:
             output_emitter.push(data)
         output_emitter.flush()

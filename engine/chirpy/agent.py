@@ -40,6 +40,7 @@ from llm_fallback import FallbackLLM
 from local_llm import DEFAULT_REPO as LOCAL_LLM_DEFAULT_REPO
 from local_llm import LocalQwenLLM
 from plugins import KokoroTTS, WhisperSTT
+import tts_watch
 from vad import build_vad
 
 logger = logging.getLogger("chirpy.agent")
@@ -299,8 +300,6 @@ async def entrypoint(ctx: JobContext):
 
     # Hot TTS/STT reload: watch config/tts.json and config/stt.json and apply
     # changes live without a restart.
-    import tts_watch
-
     tts_watch.ConfigWatcher(
         RUNTIME_TTS, lambda data: tts_watch.apply_tts_live(session._tts, data)
     ).start()

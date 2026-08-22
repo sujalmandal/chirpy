@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 
 from livekit.agents import APIConnectOptions
 from livekit.agents import llm as llm_mod
@@ -93,6 +94,9 @@ class LocalQwenLLM(llm_mod.LLM):
         self._device = device or ("mps" if _mps() else "cpu")
         self._model = None
         self._tok = None
+        # Serialize generation: `_generate` runs in a thread pool and MPS/torch
+        # is not safe for concurrent inference (e.g. a barge-in mid-turn).
+        self._gen_lock = threading.Lock()
 
     @property
     def model(self) -> str:
@@ -116,22 +120,23 @@ class LocalQwenLLM(llm_mod.LLM):
         logger.info("local Qwen loaded: %s on %s", self._repo_id, self._device)
 
     def _generate(self, chat_ctx: llm_mod.ChatContext) -> str:
-        self._ensure()
         import torch
 
-        prompt = _build_prompt(chat_ctx)
-        inputs = self._tok(prompt, return_tensors="pt").to(self._device)
-        with torch.inference_mode():
-            out = self._model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=True,
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                pad_token_id=self._tok.eos_token_id,
-            )
-        new_tokens = out[0][inputs["input_ids"].shape[1] :]
-        text = self._tok.decode(new_tokens, skip_special_tokens=True).strip()
+        with self._gen_lock:
+            self._ensure()
+            prompt = _build_prompt(chat_ctx)
+            inputs = self._tok(prompt, return_tensors="pt").to(self._device)
+            with torch.inference_mode():
+                out = self._model.generate(
+                    **inputs,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=True,
+                    temperature=TEMPERATURE,
+                    top_p=TOP_P,
+                    pad_token_id=self._tok.eos_token_id,
+                )
+            new_tokens = out[0][inputs["input_ids"].shape[1] :]
+            text = self._tok.decode(new_tokens, skip_special_tokens=True).strip()
         return text
 
     def chat(

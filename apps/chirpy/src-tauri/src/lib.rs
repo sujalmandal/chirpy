@@ -432,7 +432,7 @@ async fn download_model(app: tauri::AppHandle, kind: String, id: String) -> Resu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(Mutex::new(BackendState::new()))
         .invoke_handler(tauri::generate_handler![
@@ -458,6 +458,16 @@ pub fn run() {
             let _ = app;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Chirpy");
+        .build(tauri::generate_context!())
+        .expect("error while building Chirpy");
+
+    app.run(|app_handle, event| {
+        // Tear down the self-hosted LiveKit server and the agent worker when the
+        // app exits. Without this they leak as orphaned processes holding ports
+        // 7880/7882, which breaks the next launch (a port-in-use failure).
+        if let tauri::RunEvent::Exit = event {
+            let state = app_handle.state::<Mutex<BackendState>>();
+            let _ = stop_backend(state);
+        }
+    });
 }
