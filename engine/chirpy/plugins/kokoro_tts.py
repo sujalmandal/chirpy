@@ -140,15 +140,20 @@ class KokoroChunkedStream(tts.ChunkedStream):
             trimmed = _trim_and_cap_silence(full, SAMPLE_RATE)
             return trimmed.tobytes()
 
-        # Synthesize the whole reply, trim dead air, and push it as one
-        # continuous buffer. Pushing Kokoro's per-sentence chunks separately
-        # left 200ms+ of silence between sentences and 800ms on each end, which
-        # played back as "pausing and unpausing."
+        # Synthesize the whole reply, trim dead air, then stream it to the
+        # emitter in small real-time-paced chunks so the client's audio buffer
+        # stays fed and doesn't underrun/stutter on the live WebRTC stream.
         tts_obj.latency_cb("tts", "start")
         data = await loop.run_in_executor(None, synthesize_blocking)
         tts_obj.latency_cb("tts", "done")
         if data:
-            output_emitter.push(data)
+            chunk_bytes = SAMPLE_RATE * 2 * 50 // 1000  # 50 ms of int16 mono
+            # Deliver slightly faster than real-time so the client builds a small
+            # jitter buffer instead of underrunning at every packet boundary.
+            interval = 50 / 1000 * 0.8
+            for i in range(0, len(data), chunk_bytes):
+                output_emitter.push(data[i : i + chunk_bytes])
+                await asyncio.sleep(interval)
         output_emitter.flush()
 
 
