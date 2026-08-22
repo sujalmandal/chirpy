@@ -55,6 +55,7 @@ class WhisperSTT(stt.STT):
         compute_type: str = "int8",
         language: str = "en",
         interim_interval: float = DEFAULT_INTERIM_INTERVAL,
+        latency_cb=None,
     ):
         super().__init__(
             capabilities=STTCapabilities(
@@ -73,6 +74,9 @@ class WhisperSTT(stt.STT):
         self._vad: agent_vad.VAD | None = None
         self._vad_lock = asyncio.Lock()
         self._reload_lock = threading.Lock()
+        # Optional callback(stage, event, text="") wired to the latency tracker
+        # by the agent so VAD/STT timings reach the debug UI.
+        self.latency_cb = latency_cb or (lambda stage, event, text="": None)
 
     def prewarm(self):
         self._ensure_model()
@@ -224,12 +228,14 @@ class _WhisperStream(RecognizeStream):
             nonlocal segment, in_speech
             async for event in vad_stream:
                 if event.type == agent_vad.VADEventType.START_OF_SPEECH:
+                    stt_obj.latency_cb("vad", "start")
                     self._event_ch.send_nowait(
                         SpeechEvent(SpeechEventType.START_OF_SPEECH)
                     )
                     in_speech = True
                     segment = []
                 elif event.type == agent_vad.VADEventType.END_OF_SPEECH:
+                    stt_obj.latency_cb("vad", "end")
                     self._event_ch.send_nowait(
                         SpeechEvent(SpeechEventType.END_OF_SPEECH)
                     )
@@ -238,6 +244,7 @@ class _WhisperStream(RecognizeStream):
                     async with lock:
                         text = await stt_obj._transcribe(buf, language=self._language)
                     if text:
+                        stt_obj.latency_cb("stt", "done", text)
                         self._event_ch.send_nowait(
                             SpeechEvent(
                                 type=SpeechEventType.FINAL_TRANSCRIPT,

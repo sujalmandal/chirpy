@@ -132,6 +132,7 @@ class VoiceSession {
   onAssistantStart: () => void = () => {};
   onAssistantDelta: (delta: string) => void = () => {};
   onAssistantEnd: () => void = () => {};
+  onLatency: (payload: Record<string, unknown>) => void = () => {};
 
   get isListening() {
     return this.listening;
@@ -269,6 +270,9 @@ class VoiceSession {
         this.speaking = false;
         this.onSpeaking(false);
         this.onAssistantEnd();
+        break;
+      case "latency":
+        this.onLatency(event);
         break;
       case "error":
         this.onStatus((event.message as string) ?? "Chirpy error");
@@ -412,6 +416,16 @@ function renderDebug() {
           <div id="messages" class="messages"></div>
         </section>
       </main>
+      <section class="latency-panel">
+        <div class="panel-head">
+          <h3>Latency</h3>
+          <span class="latency-head-msg" id="latency-msg">Waiting for a turn…</span>
+          <button id="latency-clear" title="Clear latency graph">Clear</button>
+        </div>
+        <div id="latency-graph" class="latency-graph"></div>
+        <div id="latency-legend" class="latency-legend"></div>
+      </section>
+      <div class="splitter" id="logs-splitter" title="Drag to resize logs"></div>
       <section class="logs-panel">
         <div class="panel-head">
           <h3>Logs</h3>
@@ -430,7 +444,37 @@ function renderDebug() {
     const box = document.getElementById("messages");
     if (box) box.innerHTML = "";
   };
+  document.getElementById("latency-clear")!.onclick = () => clearLatency();
   updateSystemModels();
+  renderLatencyLegend();
+  setupLogsSplitter();
+}
+
+// Make the bottom logs panel height adjustable with a drag handle, and keep the
+// conversation / latency areas fluid so everything fits when the window resizes.
+function setupLogsSplitter() {
+  const splitter = document.getElementById("logs-splitter");
+  const logs = document.querySelector<HTMLElement>(".logs-panel");
+  if (!splitter || !logs) return;
+  let dragging = false;
+
+  splitter.addEventListener("mousedown", (e) => {
+    dragging = true;
+    e.preventDefault();
+    document.body.style.cursor = "ns-resize";
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const rect = document.body.getBoundingClientRect();
+    const newHeight = Math.max(80, Math.min(rect.height * 0.7, rect.bottom - e.clientY));
+    logs.style.height = `${Math.round(newHeight)}px`;
+  });
+
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    document.body.style.cursor = "";
+  });
 }
 
 function updateSystemModels() {
@@ -513,6 +557,120 @@ function updateLastUser(text: string, final: boolean) {
 
 function escapeHtml(s: string) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+}
+
+// ---------------------------------------------------------------------------
+// Latency waterfall
+// ---------------------------------------------------------------------------
+
+interface LatencyStage {
+  stage: string;
+  label: string;
+  start_ms: number;
+  dur_ms: number;
+  color: string;
+}
+
+interface LatencySample {
+  id: number;
+  stages: LatencyStage[];
+  total_ms: number;
+  vad_ms: number;
+  stt_ms: number;
+  llm_ms: number;
+  tts_ms: number;
+  tts_gen_ms: number;
+  speech_to_transcript_ms: number;
+  speech_to_reply_ms: number;
+  user_text: string;
+  assistant_text: string;
+  t: number;
+}
+
+const latencySamples: LatencySample[] = [];
+const LATENCY_STAGES = ["vad", "stt", "llm", "tts"];
+
+// Human-readable labels for the headline latency numbers.
+const LATENCY_LABELS: Record<string, string> = {
+  vad_ms: "Speech (VAD)",
+  stt_ms: "Speech → transcript",
+  llm_ms: "Transcript → reply",
+  tts_ms: "Reply → audio",
+  total_ms: "Whole turn",
+};
+
+function renderLatencyLegend() {
+  const el = document.getElementById("latency-legend");
+  if (!el) return;
+  el.innerHTML = LATENCY_STAGES.map(
+    (s) => `<span class="legend-item"><i class="swatch ${s}"></i>${s.toUpperCase()}</span>`,
+  ).join("");
+}
+
+function addLatencySample(sample: LatencySample) {
+  latencySamples.push(sample);
+  if (latencySamples.length > 60) latencySamples.shift(); // keep the graph bounded
+  renderLatencyGraph();
+  updateLatencyHeadline();
+}
+
+function clearLatency() {
+  latencySamples.length = 0;
+  renderLatencyGraph();
+  const msg = document.getElementById("latency-msg");
+  if (msg) msg.textContent = "Waiting for a turn…";
+}
+
+function updateLatencyHeadline() {
+  const el = document.getElementById("latency-msg");
+  if (!el) return;
+  const s = latencySamples[latencySamples.length - 1];
+  if (!s) return;
+  el.textContent =
+    `speech → transcript ${s.speech_to_transcript_ms}ms · reply → audio ${s.tts_ms}ms · total ${s.total_ms}ms`;
+}
+
+function renderLatencyGraph() {
+  const box = document.getElementById("latency-graph");
+  if (!box) return;
+
+  // Keep the latest turns visible, oldest at the top like a scrollback log.
+  const rows = latencySamples.slice(-20);
+  if (!rows.length) {
+    box.innerHTML = `<div class="latency-empty">Latency will appear here after the first turn.</div>`;
+    return;
+  }
+
+  box.innerHTML = rows
+    .map((s) => {
+      const time = new Date(s.t * 1000).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+      const total = Math.max(s.total_ms, 1);
+      const segs = s.stages
+        .map((st) => {
+          const pct = Math.max((st.dur_ms / total) * 100, 0.4);
+          return `<div class="seg ${st.color}" style="left:${((st.start_ms / total) * 100).toFixed(2)}%;width:${pct.toFixed(2)}%" title="${st.label}: ${st.dur_ms}ms"></div>`;
+        })
+        .join("");
+      const user = s.user_text ? ` · ${truncate(s.user_text, 40)}` : "";
+      const reply = s.assistant_text ? ` · → ${truncate(s.assistant_text, 40)}` : "";
+      return `
+      <div class="latency-row" title="turn #${s.id}${user}${reply}">
+        <span class="latency-time">${time}</span>
+        <span class="latency-id">#${s.id}</span>
+        <div class="latency-track">${segs}</div>
+        <span class="latency-total">${s.total_ms}ms</span>
+      </div>`;
+    })
+    .join("");
+  tailScroll(box);
+}
+
+function truncate(s: string, n: number) {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +1018,9 @@ async function init() {
       updateLastAssistant(e.payload as string);
     });
     listen("conversation-assistant-end", () => finishLastAssistant());
+    listen("conversation-latency", (e) => {
+      addLatencySample(e.payload as LatencySample);
+    });
     session.onStatus = (s) => {
       const el = document.getElementById("status");
       if (el) el.textContent = s;
@@ -890,6 +1051,7 @@ async function init() {
     session.onUserPartial = (text) => emit("conversation-user-partial", text);
     session.onAssistantDelta = (delta) => emit("conversation-assistant-delta", delta);
     session.onAssistantEnd = () => emit("conversation-assistant-end", null);
+    session.onLatency = (payload) => emit("conversation-latency", payload);
     setInterval(pollStatus, 1000);
   }
 }
